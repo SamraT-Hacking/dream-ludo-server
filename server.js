@@ -1,10 +1,12 @@
+
+// /dream-ludo-server/server.js
 require('dotenv').config();
 const express = require('express');
 const { createServer } = require('http');
 const { WebSocketServer } = require('ws');
 const { createClient } = require('@supabase/supabase-js');
+const { v4: uuidv4 } = require('uuid');
 
-// IMPORT GAME LOGIC
 const {
     createNewGame,
     addPlayer,
@@ -13,141 +15,153 @@ const {
     movePiece,
     leaveGame,
     sendChatMessage
-} = require("./game");
+} = require('./game');
 
+// --- Server & Supabase Setup ---
 const PORT = process.env.PORT || 8080;
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+const { SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_JWT_SECRET, SERVER_SECRET } = process.env;
+
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !SUPABASE_JWT_SECRET || !SERVER_SECRET) {
+    console.error("One or more environment variables are missing. Ensure SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_JWT_SECRET, and SERVER_SECRET are set.");
+    process.exit(1);
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 const app = express();
+app.use(express.json());
 const server = createServer(app);
+const wss = new WebSocketServer({ server });
 
-// health check
-app.get("/", (req, res) => res.send("WebSocket Server Running"));
-app.get("/health", (req, res) => res.send("OK"));
+const games = new Map(); // In-memory storage for games
 
-// WebSocket upgrade handler (Render requirement)
-const wss = new WebSocketServer({ noServer: true });
+// --- HTTP Endpoints ---
+app.get('/health', (req, res) => res.send('OK'));
 
-server.on("upgrade", (req, socket, head) => {
-    if (!req.url.startsWith("/ws/")) return socket.destroy();
+app.post('/create-game', (req, res) => {
+    const { secret, tournamentId, players } = req.body;
 
-    wss.handleUpgrade(req, socket, head, (ws) => {
-        wss.emit("connection", ws, req);
-    });
+    if (secret !== SERVER_SECRET) {
+        return res.status(401).send('Unauthorized');
+    }
+    if (!tournamentId || !players || !Array.isArray(players) || players.length === 0) {
+        return res.status(400).send('Bad Request: Missing tournamentId or players.');
+    }
+
+    const gameCode = uuidv4().substring(0, 6).toUpperCase();
+    const gameOptions = {
+        hostId: players[0].id,
+        hostName: players[0].name,
+        type: 'tournament',
+        max_players: players.length,
+        players: players, // Pass players to be added during creation
+    };
+
+    const gameState = createNewGame(gameCode, gameOptions);
+    games.set(gameCode, { state: gameState, clients: new Map(), turnTimer: null });
+
+    console.log(`Game created for tournament ${tournamentId} with code: ${gameCode}`);
+    res.status(200).json({ gameCode });
 });
 
-// In-memory game storage
-const games = new Map();
 
-// heartbeat to keep Render alive
-function heartbeat() { this.isAlive = true; }
+// --- WebSocket Server Logic ---
+wss.on('connection', (ws, req) => {
+    const gameCode = req.url.slice(1).toUpperCase();
+    
+    if (!games.has(gameCode)) {
+        ws.close(1011, 'Game not found.');
+        return;
+    }
 
-wss.on("connection", (ws, req) => {
-    ws.isAlive = true;
-    ws.on("pong", heartbeat);
+    ws.on('message', async (message) => {
+        try {
+            const { action, payload } = JSON.parse(message);
 
-    const gameCode = req.url.replace("/ws/", "");
-    console.log("WS connected for room:", gameCode);
+            if (action === 'AUTH') {
+                if (ws.userId) return;
 
-    ws.on("message", async (raw) => {
-        const { action, payload } = JSON.parse(raw);
+                const { data: { user }, error } = await supabase.auth.getUser(payload.token);
+                if (error || !user) {
+                    ws.send(JSON.stringify({ type: 'AUTH_FAILURE', payload: { message: 'Invalid token.' } }));
+                    ws.close(4001, 'Auth Failed');
+                    return;
+                }
+                
+                ws.userId = user.id;
+                ws.userName = user.user_metadata.full_name || 'Player';
+                ws.gameCode = gameCode;
+                
+                const game = games.get(gameCode);
+                game.clients.set(ws.userId, ws);
 
-        // ---------- 1. AUTH ----------
-        if (action === "AUTH") {
-            const { data, error } = await supabase.auth.getUser(payload.token);
+                if (!game.state.players.some(p => p.playerId === ws.userId)) {
+                    addPlayer(game.state, ws.userId, ws.userName);
+                }
 
-            if (error || !data.user) {
-                ws.send(JSON.stringify({ type: "AUTH_FAILURE" }));
-                return ws.close();
+                ws.send(JSON.stringify({ type: 'AUTH_SUCCESS' }));
+                console.log(`Player ${ws.userName} connected to game ${gameCode}`);
+                broadcastGameState(gameCode);
+                return;
             }
 
-            ws.userId = data.user.id;
-            ws.userName = payload.name || "Player";
-
-            ws.send(JSON.stringify({ type: "AUTH_SUCCESS" }));
-
-            // CREATE GAME IF NOT EXISTS
-            if (!games.get(gameCode)) {
-                console.log("Creating new game:", gameCode);
-                games.set(
-                    gameCode,
-                    createNewGame(gameCode, {
-                        hostId: ws.userId,
-                        hostName: ws.userName
-                    })
-                );
-            }
+            if (!ws.userId) return ws.send(JSON.stringify({ type: 'ERROR', payload: { message: 'Not authenticated.' } }));
 
             const game = games.get(gameCode);
+            if (!game) return;
 
-            // ADD PLAYER TO GAME
-            addPlayer(game, ws.userId, ws.userName);
+            const player = game.state.players.find(p => p.playerId === ws.userId);
+            if (!player || player.isRemoved) return;
 
-            // Track WebSocket instance
-            if (!game.playersWS) game.playersWS = new Map();
-            game.playersWS.set(ws.userId, ws);
+            switch (action) {
+                case 'START_GAME': startGame(game.state, ws.userId); break;
+                case 'ROLL_DICE': rollDice(game.state, ws.userId); break;
+                case 'MOVE_PIECE': movePiece(game.state, ws.userId, payload.pieceId); break;
+                case 'LEAVE_GAME': leaveGame(game.state, ws.userId); break;
+                case 'SEND_CHAT_MESSAGE': sendChatMessage(game.state, ws.userId, payload.text); break;
+                default: console.warn(`Unknown action: ${action}`); return;
+            }
 
             broadcastGameState(gameCode);
-            return;
-        }
 
-        // ---------- 2. GAME ACTIONS ----------
-        const game = games.get(gameCode);
-        if (!game || !ws.userId) return;
-
-        if (action === "START_GAME") {
-            startGame(game, ws.userId);
+        } catch (err) {
+            console.error('Error processing message:', err);
+            ws.send(JSON.stringify({ type: 'ERROR', payload: { message: 'An internal server error occurred.' } }));
         }
-        if (action === "ROLL_DICE") {
-            rollDice(game, ws.userId);
-        }
-        if (action === "MOVE_PIECE") {
-            movePiece(game, ws.userId, payload.pieceId);
-        }
-        if (action === "LEAVE_GAME") {
-            leaveGame(game, ws.userId);
-        }
-        if (action === "SEND_CHAT") {
-            sendChatMessage(game, ws.userId, payload.text);
-        }
-
-        broadcastGameState(gameCode);
     });
 
-    ws.on("close", () => {
+    ws.on('close', () => {
+        const gameCode = ws.gameCode;
+        if (!gameCode) return;
+        
         const game = games.get(gameCode);
         if (game && ws.userId) {
-            leaveGame(game, ws.userId);
-            game.playersWS.delete(ws.userId);
+            game.clients.delete(ws.userId);
+            console.log(`Player ${ws.userName} disconnected from ${gameCode}`);
+            
+            leaveGame(game.state, ws.userId);
             broadcastGameState(gameCode);
+
+            if (game.clients.size === 0) {
+                console.log(`Game ${gameCode} is empty, removing.`);
+                clearTimeout(game.turnTimer);
+                games.delete(gameCode);
+            }
         }
     });
 });
 
-// heartbeat interval
-setInterval(() => {
-    wss.clients.forEach(ws => {
-        if (!ws.isAlive) return ws.terminate();
-        ws.isAlive = false;
-        ws.ping();
-    });
-}, 30000);
-
-// Broadcast function
 function broadcastGameState(gameCode) {
     const game = games.get(gameCode);
-    if (!game || !game.playersWS) return;
+    if (!game) return;
 
-    const payload = JSON.stringify({
-        type: "GAME_STATE_UPDATE",
-        payload: game
-    });
+    const statePayload = JSON.stringify({ type: 'GAME_STATE_UPDATE', payload: game.state });
 
-    for (const ws of game.playersWS.values()) {
-        if (ws.readyState === ws.OPEN) ws.send(payload);
+    for (const client of game.clients.values()) {
+        if (client.readyState === client.OPEN) {
+            client.send(statePayload);
+        }
     }
 }
 
-server.listen(PORT, () => {
-    console.log("Server running on", PORT);
-});
+server.listen(PORT, () => console.log(`Dream Ludo server listening on port ${PORT}`));
