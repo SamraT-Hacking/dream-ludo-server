@@ -1,0 +1,16 @@
+{
+  "name": "dream-ludo-server",
+  "version": "1.0.0",
+  "description": "WebSocket server for Dream Ludo",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.0.0",
+    "dotenv": "^16.0.0",
+    "express": "^4.18.0",
+    "uuid": "^9.0.0",
+    "ws": "^8.10.0"
+  }
+}
