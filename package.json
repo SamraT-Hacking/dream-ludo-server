@@ -2,9 +2,13 @@
   "name": "dream-ludo-server",
   "version": "1.0.0",
   "description": "WebSocket server for Dream Ludo",
+  "type": "commonjs",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
+  },
+  "engines": {
+    "node": "18.x"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.0.0",
