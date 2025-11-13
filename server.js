@@ -1,107 +1,153 @@
-// server.js
 require('dotenv').config();
 const express = require('express');
 const { createServer } = require('http');
 const { WebSocketServer } = require('ws');
 const { createClient } = require('@supabase/supabase-js');
-const { v4: uuidv4 } = require('uuid');
-// You will need to create the game logic in game.js
-// const { createNewGame, handlePlayerAction } = require('./game');
 
-// --- Server & Supabase Setup ---
+// IMPORT GAME LOGIC
+const {
+    createNewGame,
+    addPlayer,
+    startGame,
+    rollDice,
+    movePiece,
+    leaveGame,
+    sendChatMessage
+} = require("./game");
+
 const PORT = process.env.PORT || 8080;
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 
 const app = express();
 const server = createServer(app);
-const wss = new WebSocketServer({ server });
 
-// Simple health check endpoint for Render
-app.get('/health', (req, res) => res.send('OK'));
+// health check
+app.get("/", (req, res) => res.send("WebSocket Server Running"));
+app.get("/health", (req, res) => res.send("OK"));
 
-// In-memory storage for active games. In production, consider Redis.
+// WebSocket upgrade handler (Render requirement)
+const wss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+    if (!req.url.startsWith("/ws/")) return socket.destroy();
+
+    wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit("connection", ws, req);
+    });
+});
+
+// In-memory game storage
 const games = new Map();
 
-// --- WebSocket Server Logic ---
-wss.on('connection', (ws, req) => {
-    const gameCode = req.url.slice(1); // Get game code from URL: /<code>
-    
-    // 1. Await Authentication
-    ws.on('message', async (message) => {
-        const { action, payload } = JSON.parse(message);
+// heartbeat to keep Render alive
+function heartbeat() { this.isAlive = true; }
 
-        if (action === 'AUTH') {
-            try {
-                // 2. Verify JWT from Supabase
-                const { data: { user }, error } = await supabase.auth.getUser(payload.token);
-                if (error || !user) {
-                    ws.send(JSON.stringify({ type: 'AUTH_FAILURE', payload: { message: 'Invalid token.' } }));
-                    ws.close();
-                    return;
-                }
-                
-                // Attach user info to the WebSocket connection
-                ws.userId = user.id;
-                ws.send(JSON.stringify({ type: 'AUTH_SUCCESS' }));
+wss.on("connection", (ws, req) => {
+    ws.isAlive = true;
+    ws.on("pong", heartbeat);
 
-                // 3. Add player to the game room
-                let game = games.get(gameCode);
-                // If the game doesn't exist, this is where you'd create it
-                // based on your game creation logic (e.g., from a tournament).
-                if (!game) {
-                    // This logic needs to be robust. For now, let's assume game is created elsewhere.
-                    ws.close(); return;
-                }
-                
-                game.players.set(ws.userId, ws); // Add player WebSocket to the room
-                
-                // 4. Broadcast the updated game state to everyone in the room
-                broadcastGameState(gameCode);
+    const gameCode = req.url.replace("/ws/", "");
+    console.log("WS connected for room:", gameCode);
 
-            } catch (err) {
-                ws.send(JSON.stringify({ type: 'AUTH_FAILURE', payload: { message: 'Auth error.' } }));
-                ws.close();
+    ws.on("message", async (raw) => {
+        const { action, payload } = JSON.parse(raw);
+
+        // ---------- 1. AUTH ----------
+        if (action === "AUTH") {
+            const { data, error } = await supabase.auth.getUser(payload.token);
+
+            if (error || !data.user) {
+                ws.send(JSON.stringify({ type: "AUTH_FAILURE" }));
+                return ws.close();
             }
-        } else {
-            // Handle other game actions (ROLL_DICE, MOVE_PIECE, etc.)
-            // These should only be processed AFTER a user is authenticated.
-            if (!ws.userId) return; // Ignore messages from unauthenticated clients
 
-            // You would call your game logic handler here
-            // const updatedGameState = handlePlayerAction(gameCode, ws.userId, action, payload);
-            // games.set(gameCode, updatedGameState);
-            
-            // And broadcast the new state
+            ws.userId = data.user.id;
+            ws.userName = payload.name || "Player";
+
+            ws.send(JSON.stringify({ type: "AUTH_SUCCESS" }));
+
+            // CREATE GAME IF NOT EXISTS
+            if (!games.get(gameCode)) {
+                console.log("Creating new game:", gameCode);
+                games.set(
+                    gameCode,
+                    createNewGame(gameCode, {
+                        hostId: ws.userId,
+                        hostName: ws.userName
+                    })
+                );
+            }
+
+            const game = games.get(gameCode);
+
+            // ADD PLAYER TO GAME
+            addPlayer(game, ws.userId, ws.userName);
+
+            // Track WebSocket instance
+            if (!game.playersWS) game.playersWS = new Map();
+            game.playersWS.set(ws.userId, ws);
+
             broadcastGameState(gameCode);
+            return;
         }
+
+        // ---------- 2. GAME ACTIONS ----------
+        const game = games.get(gameCode);
+        if (!game || !ws.userId) return;
+
+        if (action === "START_GAME") {
+            startGame(game, ws.userId);
+        }
+        if (action === "ROLL_DICE") {
+            rollDice(game, ws.userId);
+        }
+        if (action === "MOVE_PIECE") {
+            movePiece(game, ws.userId, payload.pieceId);
+        }
+        if (action === "LEAVE_GAME") {
+            leaveGame(game, ws.userId);
+        }
+        if (action === "SEND_CHAT") {
+            sendChatMessage(game, ws.userId, payload.text);
+        }
+
+        broadcastGameState(gameCode);
     });
 
-    ws.on('close', () => {
-        // Handle player disconnection
-        // Remove player from the game room and notify others.
-        let game = games.get(gameCode);
+    ws.on("close", () => {
+        const game = games.get(gameCode);
         if (game && ws.userId) {
-            game.players.delete(ws.userId);
-            // You might want to update the game state to mark player as disconnected
+            leaveGame(game, ws.userId);
+            game.playersWS.delete(ws.userId);
             broadcastGameState(gameCode);
         }
     });
 });
 
+// heartbeat interval
+setInterval(() => {
+    wss.clients.forEach(ws => {
+        if (!ws.isAlive) return ws.terminate();
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, 30000);
+
+// Broadcast function
 function broadcastGameState(gameCode) {
     const game = games.get(gameCode);
-    if (!game) return;
+    if (!game || !game.playersWS) return;
 
-    const statePayload = JSON.stringify({
-        type: 'GAME_STATE_UPDATE',
-        payload: game.state // `game.state` should be the GameState object
+    const payload = JSON.stringify({
+        type: "GAME_STATE_UPDATE",
+        payload: game
     });
 
-    for (const client of game.players.values()) {
-        if (client.readyState === client.OPEN) {
-            client.send(statePayload);
-        }
+    for (const ws of game.playersWS.values()) {
+        if (ws.readyState === ws.OPEN) ws.send(payload);
     }
 }
 
-server.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+server.listen(PORT, () => {
+    console.log("Server running on", PORT);
+});
