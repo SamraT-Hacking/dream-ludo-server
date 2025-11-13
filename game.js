@@ -180,7 +180,8 @@ function addPlayer(gameState, playerId, playerName) {
  * Starts the game, sets player order, and begins the first turn.
  */
 function startGame(gameState, requestingPlayerId) {
-    if (gameState.hostId !== requestingPlayerId) {
+    // For manual games, only host can start. System can start tournaments.
+    if (requestingPlayerId && gameState.hostId !== requestingPlayerId) {
         gameState.message = "Only the host can start the game.";
         return;
     }
