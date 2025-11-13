@@ -1,4 +1,3 @@
-
 // /dream-ludo-server/server.js
 require('dotenv').config();
 const express = require('express');
@@ -66,17 +65,53 @@ app.post('/create-game', (req, res) => {
 
 
 // --- WebSocket Server Logic ---
-wss.on('connection', (ws, req) => {
+wss.on('connection', async (ws, req) => {
     const gameCode = req.url.slice(1).toUpperCase();
     
+    // If game is not in memory, try to create it from a valid tournament
     if (!games.has(gameCode)) {
-        ws.close(1011, 'Game not found.');
-        return;
+        try {
+            const { data: tournament, error } = await supabase
+                .from('tournaments')
+                .select('*')
+                .eq('game_code', gameCode)
+                .single();
+
+            if (error || !tournament) {
+                console.log(`Connection rejected: No tournament found for game code ${gameCode}`);
+                ws.close(1011, 'Game not found or invalid code.');
+                return;
+            }
+            
+            const host = tournament.players_joined[0];
+            if (!host) {
+                 ws.close(1011, 'Tournament has no players.');
+                 return;
+            }
+
+            const gameOptions = {
+                hostId: host.id,
+                hostName: host.name,
+                type: 'tournament',
+                max_players: tournament.max_players,
+            };
+
+            const gameState = createNewGame(gameCode, gameOptions);
+            games.set(gameCode, { state: gameState, clients: new Map(), turnTimer: null });
+            console.log(`Game room created on-the-fly for tournament ${tournament.title} (${gameCode})`);
+
+        } catch (e) {
+            console.error(`Error validating game code ${gameCode} with Supabase:`, e);
+            ws.close(1011, 'Server error validating game.');
+            return;
+        }
     }
 
     ws.on('message', async (message) => {
         try {
             const { action, payload } = JSON.parse(message);
+            const game = games.get(gameCode);
+            if (!game) return;
 
             if (action === 'AUTH') {
                 if (ws.userId) return;
@@ -92,7 +127,6 @@ wss.on('connection', (ws, req) => {
                 ws.userName = user.user_metadata.full_name || 'Player';
                 ws.gameCode = gameCode;
                 
-                const game = games.get(gameCode);
                 game.clients.set(ws.userId, ws);
 
                 if (!game.state.players.some(p => p.playerId === ws.userId)) {
@@ -102,13 +136,19 @@ wss.on('connection', (ws, req) => {
                 ws.send(JSON.stringify({ type: 'AUTH_SUCCESS' }));
                 console.log(`Player ${ws.userName} connected to game ${gameCode}`);
                 broadcastGameState(gameCode);
+                
+                // Check for auto-start condition
+                if (game.state.type === 'tournament' && game.state.players.length === game.state.max_players && game.state.gameStatus === 'Setup') {
+                    console.log(`Tournament game ${gameCode} is full. Starting automatically.`);
+                    setTimeout(() => {
+                        startGame(game.state, null); // System start
+                        broadcastGameState(gameCode);
+                    }, 1500);
+                }
                 return;
             }
 
             if (!ws.userId) return ws.send(JSON.stringify({ type: 'ERROR', payload: { message: 'Not authenticated.' } }));
-
-            const game = games.get(gameCode);
-            if (!game) return;
 
             const player = game.state.players.find(p => p.playerId === ws.userId);
             if (!player || player.isRemoved) return;
