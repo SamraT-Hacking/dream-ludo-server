@@ -1,3 +1,4 @@
+
 // /dream-ludo-server/server.js
 require('dotenv').config();
 const express = require('express');
@@ -60,6 +61,12 @@ wss.on('connection', async (ws, req) => {
 
             if (tournamentError || !tournament) {
                 ws.close(1011, 'Game not found.');
+                return;
+            }
+
+            // IMPORTANT: Only create a new game room if the tournament is ACTIVE.
+            if (tournament.status !== 'ACTIVE') {
+                ws.close(1011, `Tournament is not active. Status: ${tournament.status}`);
                 return;
             }
             
@@ -240,12 +247,29 @@ async function handleGameFinish(gameCode) {
     clearTimeout(game.turnTimer);
     game.turnTimer = null;
 
-    const { error } = await supabase
-        .from('game_history')
-        .insert({ game_code: gameCode, final_state: game.state });
+    const finalState = game.state;
 
-    if (error) {
-        console.error(`Failed to archive game ${gameCode}:`, error);
+    // Archive the game state
+    const { error: historyError } = await supabase
+        .from('game_history')
+        .insert({ game_code: gameCode, final_state: finalState });
+
+    if (historyError) {
+        console.error(`Failed to archive game ${gameCode}:`, historyError);
+    }
+
+    // If it was a tournament game, update the tournament's status
+    if (finalState.type === 'tournament') {
+        const { error: updateError } = await supabase
+            .from('tournaments')
+            .update({ status: 'COMPLETED' })
+            .eq('game_code', gameCode);
+
+        if (updateError) {
+            console.error(`Failed to update tournament status for game ${gameCode}:`, updateError);
+        } else {
+            console.log(`Tournament with game code ${gameCode} marked as COMPLETED.`);
+        }
     }
 
     // Wait a moment before deleting to ensure clients get the final state
