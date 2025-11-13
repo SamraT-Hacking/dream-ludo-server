@@ -10,6 +10,7 @@ const TOTAL_PATH_LENGTH = 52;
 const HOME_STRETCH_LENGTH = 6;
 const FINISH_POSITION_START = 100;
 const TURN_TIME_LIMIT = 30;
+const MAX_INACTIVE_TURNS = 3;
 
 const START_POSITIONS = {
   [PlayerColor.Green]: 1,
@@ -49,6 +50,7 @@ function createPlayer(playerId, name, color, isHost = false) {
     hasFinished: false,
     isRemoved: false,
     inactiveTurns: 0,
+    disconnected: false,
   };
 }
 
@@ -108,23 +110,36 @@ function calculateMovablePieces(player, diceValue) {
  */
 function advanceTurn(gameState) {
     if (gameState.gameStatus !== GameStatus.Playing) return;
+    
+    // Reset current player's inactive turns since they made a move
+    if (gameState.players[gameState.currentPlayerIndex]) {
+        gameState.players[gameState.currentPlayerIndex].inactiveTurns = 0;
+    }
+
     let nextIndex = (gameState.currentPlayerIndex + 1) % gameState.players.length;
     let checkedAll = 0;
-    // Skip players who have finished or been removed
-    while ((gameState.players[nextIndex].hasFinished || gameState.players[nextIndex].isRemoved) && checkedAll < gameState.players.length) {
+    
+    // Skip players who have finished, been removed, or are disconnected
+    while (
+        (gameState.players[nextIndex].hasFinished || gameState.players[nextIndex].isRemoved || gameState.players[nextIndex].disconnected) && 
+        checkedAll < gameState.players.length
+    ) {
         nextIndex = (nextIndex + 1) % gameState.players.length;
         checkedAll++;
     }
 
-    // If all remaining players have finished, end the game.
-    if (checkedAll >= gameState.players.length) {
+    // If all remaining players have finished or left, end the game.
+    const activePlayers = gameState.players.filter(p => !p.isRemoved && !p.hasFinished);
+    if (activePlayers.length <= 1 && gameState.players.length > 1) {
         gameState.gameStatus = GameStatus.Finished;
-        gameState.message = "All players have finished!";
+        gameState.winner = activePlayers[0] || null; // The last one standing is the winner
+        gameState.message = "Game Over!";
         return;
     }
 
     gameState.currentPlayerIndex = nextIndex;
     gameState.diceValue = null;
+    gameState.isRolling = false;
     gameState.movablePieces = [];
     gameState.turnTimeLeft = TURN_TIME_LIMIT;
     gameState.message = `${gameState.players[nextIndex].name}'s turn.`;
@@ -151,6 +166,7 @@ function createNewGame(gameId, options = {}) {
     winner: null,
     message: 'Waiting for players...',
     movablePieces: [],
+    isRolling: false,
     turnTimeLeft: TURN_TIME_LIMIT,
     chatMessages: [],
   };
@@ -180,7 +196,6 @@ function addPlayer(gameState, playerId, playerName) {
  * Starts the game, sets player order, and begins the first turn.
  */
 function startGame(gameState, requestingPlayerId) {
-    // For manual games, only host can start. System can start tournaments.
     if (requestingPlayerId && gameState.hostId !== requestingPlayerId) {
         gameState.message = "Only the host can start the game.";
         return;
@@ -192,35 +207,38 @@ function startGame(gameState, requestingPlayerId) {
 
     gameState.gameStatus = GameStatus.Playing;
     gameState.playerOrder = gameState.players.map(p => p.color);
-    gameState.currentPlayerIndex = 0; // Or a random index
+    gameState.currentPlayerIndex = 0;
     gameState.turnTimeLeft = TURN_TIME_LIMIT;
     gameState.message = `Game started! ${gameState.players[0].name}'s turn.`;
 }
 
-/**
- * Handles a player's dice roll action.
- */
-function rollDice(gameState, playerId) {
+function initiateRoll(gameState, playerId) {
     const currentPlayer = gameState.players[gameState.currentPlayerIndex];
-    if (currentPlayer.playerId !== playerId || gameState.diceValue !== null) return;
+    if (currentPlayer.playerId !== playerId || gameState.diceValue !== null || gameState.isRolling) return;
+    gameState.isRolling = true;
+    gameState.message = `${currentPlayer.name} is rolling...`;
+}
+
+function completeRoll(gameState, playerId) {
+    const currentPlayer = gameState.players[gameState.currentPlayerIndex];
+    if (currentPlayer.playerId !== playerId || !gameState.isRolling) return;
 
     const diceValue = Math.floor(Math.random() * 6) + 1;
     gameState.diceValue = diceValue;
+    gameState.isRolling = false;
     
     const movablePieces = calculateMovablePieces(currentPlayer, diceValue);
     gameState.movablePieces = movablePieces;
     gameState.message = `${currentPlayer.name} rolled a ${diceValue}.`;
 
-    // If no moves are possible, the turn advances immediately.
-    // This is more stable than using a server-side timer.
     if (movablePieces.length === 0) {
-        advanceTurn(gameState);
+        // Use a short delay before auto-advancing turn to let players see the roll.
+        // The server will handle this with a timeout.
+        return true; // Indicates that the turn should advance
     }
+    return false;
 }
 
-/**
- * Handles a player's move piece action.
- */
 function movePiece(gameState, playerId, pieceId) {
     const currentPlayer = gameState.players[gameState.currentPlayerIndex];
     if (currentPlayer.playerId !== playerId || !gameState.movablePieces.includes(pieceId)) return;
@@ -236,7 +254,6 @@ function movePiece(gameState, playerId, pieceId) {
     let capturedPiece = false;
     gameState.message = `${currentPlayer.name} moved a piece.`;
 
-    // Check for capture
     if (newState === PieceState.Active && newPos < FINISH_POSITION_START && !SAFE_SPOTS.includes(newPos)) {
         gameState.players.forEach(opponent => {
             if (opponent.color === currentPlayer.color) return;
@@ -251,42 +268,79 @@ function movePiece(gameState, playerId, pieceId) {
         });
     }
 
-    // Check for win condition
     if (currentPlayer.pieces.every(p => p.state === PieceState.Finished)) {
         currentPlayer.hasFinished = true;
-        gameState.winner = currentPlayer;
-        gameState.gameStatus = GameStatus.Finished;
-        gameState.message = `${currentPlayer.name} wins the game!`;
-        return; // Game over
+        const activePlayers = gameState.players.filter(p => !p.isRemoved && !p.hasFinished);
+        if (activePlayers.length <= 1) {
+            gameState.winner = currentPlayer;
+            gameState.gameStatus = GameStatus.Finished;
+            gameState.message = `${currentPlayer.name} wins the game!`;
+        } else {
+             gameState.message = `${currentPlayer.name} has finished!`;
+             advanceTurn(gameState);
+        }
+        return;
     }
 
-    // Don't advance turn if player rolled a 6 or captured a piece
     if (gameState.diceValue === 6 || capturedPiece) {
         gameState.diceValue = null;
         gameState.movablePieces = [];
         gameState.message += " Roll again!";
+        gameState.turnTimeLeft = TURN_TIME_LIMIT;
     } else {
         advanceTurn(gameState);
     }
 }
 
-/**
- * Handles a player leaving the game.
- */
-function leaveGame(gameState, playerId) {
+function handleMissedTurn(gameState) {
+    const currentPlayer = gameState.players[gameState.currentPlayerIndex];
+    if (!currentPlayer || gameState.gameStatus !== GameStatus.Playing) return;
+
+    currentPlayer.inactiveTurns += 1;
+    gameState.message = `${currentPlayer.name} missed their turn.`;
+
+    if (currentPlayer.inactiveTurns >= MAX_INACTIVE_TURNS) {
+        leaveGame(gameState, currentPlayer.playerId);
+    } else {
+        advanceTurn(gameState);
+    }
+}
+
+function handlePlayerDisconnect(gameState, playerId) {
     const player = gameState.players.find(p => p.playerId === playerId);
     if (player) {
+        player.disconnected = true;
+        gameState.message = `${player.name} disconnected.`;
+    }
+}
+
+function handlePlayerReconnect(gameState, playerId) {
+    const player = gameState.players.find(p => p.playerId === playerId);
+    if (player) {
+        player.disconnected = false;
+        gameState.message = `${player.name} reconnected!`;
+    }
+}
+
+function leaveGame(gameState, playerId) {
+    const player = gameState.players.find(p => p.playerId === playerId);
+    if (player && !player.isRemoved) {
         player.isRemoved = true;
+        player.disconnected = true;
         gameState.message = `${player.name} left the game.`;
-        if (gameState.players[gameState.currentPlayerIndex].playerId === playerId) {
+        
+        // Check for win condition
+        const activePlayers = gameState.players.filter(p => !p.isRemoved && !p.hasFinished);
+        if (activePlayers.length === 1 && gameState.players.length > 1) {
+             gameState.winner = activePlayers[0];
+             gameState.gameStatus = GameStatus.Finished;
+             gameState.message = `${activePlayers[0].name} wins as the opponent left!`;
+        } else if (gameState.players[gameState.currentPlayerIndex].playerId === playerId) {
             advanceTurn(gameState);
         }
     }
 }
 
-/**
- * Adds a chat message to the game state.
- */
 function sendChatMessage(gameState, playerId, text) {
     const player = gameState.players.find(p => p.playerId === playerId);
     if (!player) return;
@@ -300,21 +354,14 @@ function sendChatMessage(gameState, playerId, text) {
         timestamp: Date.now(),
     };
 
-    if (!gameState.chatMessages) {
-        gameState.chatMessages = [];
-    }
+    if (!gameState.chatMessages) gameState.chatMessages = [];
     gameState.chatMessages.push(message);
-    if (gameState.chatMessages.length > 50) { // Keep chat history manageable
-        gameState.chatMessages.shift();
-    }
+    if (gameState.chatMessages.length > 50) gameState.chatMessages.shift();
 }
 
 module.exports = {
-    createNewGame,
-    addPlayer,
-    startGame,
-    rollDice,
-    movePiece,
-    leaveGame,
-    sendChatMessage
+    createNewGame, addPlayer, startGame,
+    initiateRoll, completeRoll, movePiece,
+    leaveGame, sendChatMessage, handleMissedTurn,
+    handlePlayerDisconnect, handlePlayerReconnect, advanceTurn
 };
