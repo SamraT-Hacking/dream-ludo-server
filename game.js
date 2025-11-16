@@ -1,4 +1,3 @@
-
 // /dream-ludo-server/game.js
 const { v4: uuidv4 } = require('uuid');
 
@@ -390,6 +389,7 @@ async function sendChatMessage(gameState, playerId, text, supabase) {
     gameState.chatMessages.push(message);
     if (gameState.chatMessages.length > 50) gameState.chatMessages.shift();
     
+    // **DATABASE INSERTION LOGIC**
     if (gameState.tournamentId && supabase) {
         try {
             const { error } = await supabase.from('chat_messages').insert({
@@ -398,9 +398,11 @@ async function sendChatMessage(gameState, playerId, text, supabase) {
                 username: player.name,
                 message_text: text,
             });
-            if (error) console.error('Error saving chat message:', error.message);
+            if (error) {
+                console.error('Supabase error saving chat message:', error.message);
+            }
         } catch(e) {
-            console.error('Exception saving chat message:', e.message);
+            console.error('Exception while trying to save chat message:', e.message);
         }
     }
 }
