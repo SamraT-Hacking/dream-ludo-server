@@ -14,14 +14,17 @@ const {
 
 // --- Server & Supabase Setup ---
 const PORT = process.env.PORT || 8080;
-const { SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_JWT_SECRET } = process.env;
+// **MODIFIED**: Now requires SUPABASE_SERVICE_KEY for admin operations.
+const { SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_KEY } = process.env;
 
-if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !SUPABASE_JWT_SECRET) {
-    console.error("One or more Supabase environment variables are missing.");
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !SUPABASE_SERVICE_KEY) {
+    console.error("CRITICAL ERROR: One or more Supabase environment variables are missing.");
+    console.error("Ensure SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_SERVICE_KEY are set in your .env file.");
     process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY || SUPABASE_ANON_KEY);
+// **MODIFIED**: Initialize with the service key to bypass RLS for server operations.
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const games = new Map(); // In-memory storage for active games
 const RECONNECT_GRACE_PERIOD = 30000; // 30 seconds
 
