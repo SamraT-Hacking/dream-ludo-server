@@ -1,4 +1,3 @@
-
 // /dream-ludo-server/server.js
 require('dotenv').config();
 const express = require('express');
@@ -37,22 +36,12 @@ app.get('/health', (req, res) => res.send('OK'));
 wss.on('connection', async (ws, req) => {
     const gameCode = req.url.slice(1).toUpperCase();
     
+    // The logic to fetch completed/archived games from a different table has been removed
+    // as it created complexity. Clients will now just see a "Game not found" error if
+    // the game is over and removed from memory, which is a simpler and acceptable flow.
+    
     if (!games.has(gameCode)) {
         try {
-            // Check for completed games first
-            const { data: history, error: historyError } = await supabase
-                .from('game_history')
-                .select('final_state')
-                .eq('game_code', gameCode)
-                .single();
-
-            if (history) {
-                ws.send(JSON.stringify({ type: 'GAME_ARCHIVED', payload: history.final_state }));
-                ws.close();
-                return;
-            }
-
-            // If not completed, check for active tournaments to create the game on-the-fly
             const { data: tournament, error: tournamentError } = await supabase
                 .from('tournaments')
                 .select('*')
@@ -64,7 +53,6 @@ wss.on('connection', async (ws, req) => {
                 return;
             }
 
-            // IMPORTANT: Only create a new game room if the tournament is ACTIVE.
             if (tournament.status !== 'ACTIVE') {
                 ws.close(1011, `Tournament is not active. Status: ${tournament.status}`);
                 return;
@@ -107,7 +95,6 @@ wss.on('connection', async (ws, req) => {
                 
                 game.clients.set(ws.userId, ws);
 
-                // Handle reconnection
                 const existingPlayer = game.state.players.find(p => p.playerId === ws.userId);
                 if (existingPlayer && existingPlayer.disconnected) {
                     clearTimeout(game.reconnectTimers.get(ws.userId));
@@ -134,7 +121,6 @@ wss.on('connection', async (ws, req) => {
             const player = game.state.players.find(p => p.playerId === ws.userId);
             if (!player || player.isRemoved) return;
 
-            // Any valid action from a player resets their turn timer
             if (game.state.players[game.state.currentPlayerIndex].playerId === ws.userId) {
                 startTurnTimer(gameCode);
             }
@@ -154,12 +140,12 @@ wss.on('connection', async (ws, req) => {
                                 advanceTurn(game.state);
                                 broadcastGameState(gameCode);
                                 startTurnTimer(gameCode);
-                            }, 1000); // Delay for user to see result
+                            }, 1000);
                         } else {
                            broadcastGameState(gameCode);
                         }
                     }, 1000);
-                    return; // Avoid double broadcast
+                    return;
                 case 'MOVE_PIECE': movePiece(game.state, ws.userId, payload.pieceId); startTurnTimer(gameCode); break;
                 case 'LEAVE_GAME': leaveGame(game.state, ws.userId); startTurnTimer(gameCode); break;
                 case 'SEND_CHAT_MESSAGE': sendChatMessage(game.state, ws.userId, payload.text); break;
@@ -232,11 +218,52 @@ function startTurnTimer(gameCode) {
             }
         } else {
             game.turnTimer = setTimeout(timerTick, 1000);
-            // Infrequent broadcast to update timer on clients
             if(game.state.turnTimeLeft % 5 === 0) broadcastGameState(gameCode);
         }
     };
     game.turnTimer = setTimeout(timerTick, 1000);
+}
+
+async function archiveGameData(gameCode) {
+    const game = games.get(gameCode);
+    if (!game) return;
+
+    const { state: finalState } = game;
+    const { data: tournament, error: findError } = await supabase
+        .from('tournaments')
+        .select('id')
+        .eq('game_code', gameCode)
+        .single();
+        
+    if (findError || !tournament) {
+        console.error(`Could not find tournament ID for game code ${gameCode}:`, findError);
+        return;
+    }
+    const tournamentId = tournament.id;
+
+    // Archive chat messages
+    if (finalState.chatMessages && finalState.chatMessages.length > 0) {
+        const chatToInsert = finalState.chatMessages.map(msg => ({
+            tournament_id: tournamentId,
+            user_id: msg.playerId,
+            username: msg.name,
+            message_text: msg.text,
+        }));
+        const { error: chatError } = await supabase.from('chat_messages').insert(chatToInsert);
+        if (chatError) console.error(`Failed to archive chat for ${gameCode}:`, chatError);
+    }
+
+    // Archive turn history
+    if (finalState.turn_history && finalState.turn_history.length > 0) {
+        const turnsToInsert = finalState.turn_history.map(turn => ({
+            tournament_id: tournamentId,
+            user_id: turn.userId,
+            username: turn.name,
+            description: turn.description,
+        }));
+        const { error: turnError } = await supabase.from('game_turn_history').insert(turnsToInsert);
+        if (turnError) console.error(`Failed to archive turns for ${gameCode}:`, turnError);
+    }
 }
 
 async function handleGameFinish(gameCode) {
@@ -247,32 +274,11 @@ async function handleGameFinish(gameCode) {
     clearTimeout(game.turnTimer);
     game.turnTimer = null;
 
-    const finalState = game.state;
+    // Persist chat and turn history
+    await archiveGameData(gameCode);
 
-    // Archive the game state
-    const { error: historyError } = await supabase
-        .from('game_history')
-        .insert({ game_code: gameCode, final_state: finalState });
-
-    if (historyError) {
-        console.error(`Failed to archive game ${gameCode}:`, historyError);
-    }
-
-    // If it was a tournament game, update the tournament's status
-    if (finalState.type === 'tournament') {
-        const { error: updateError } = await supabase
-            .from('tournaments')
-            .update({ status: 'COMPLETED' })
-            .eq('game_code', gameCode);
-
-        if (updateError) {
-            console.error(`Failed to update tournament status for game ${gameCode}:`, updateError);
-        } else {
-            console.log(`Tournament with game code ${gameCode} marked as COMPLETED.`);
-        }
-    }
-
-    // Wait a moment before deleting to ensure clients get the final state
+    // After archiving, we can remove the game from memory.
+    // The main game flow will handle tournament status updates via RPCs.
     setTimeout(() => {
         games.delete(gameCode);
         console.log(`Game ${gameCode} removed from memory.`);
