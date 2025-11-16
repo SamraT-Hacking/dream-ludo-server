@@ -134,6 +134,7 @@ function advanceTurn(gameState) {
         gameState.gameStatus = GameStatus.Finished;
         gameState.winner = activePlayers[0] || null; // The last one standing is the winner
         gameState.message = "Game Over!";
+        gameState.turn_history.push({ description: `Game finished. Winner: ${gameState.winner?.name || 'None'}` });
         return;
     }
 
@@ -169,6 +170,7 @@ function createNewGame(gameId, options = {}) {
     isRolling: false,
     turnTimeLeft: TURN_TIME_LIMIT,
     chatMessages: [],
+    turn_history: [],
   };
 
   initialPlayers.forEach(p => addPlayer(gameState, p.id, p.name));
@@ -210,6 +212,7 @@ function startGame(gameState, requestingPlayerId) {
     gameState.currentPlayerIndex = 0;
     gameState.turnTimeLeft = TURN_TIME_LIMIT;
     gameState.message = `Game started! ${gameState.players[0].name}'s turn.`;
+    gameState.turn_history.push({ description: 'Game started.' });
 }
 
 function initiateRoll(gameState, playerId) {
@@ -230,6 +233,8 @@ function completeRoll(gameState, playerId) {
     const movablePieces = calculateMovablePieces(currentPlayer, diceValue);
     gameState.movablePieces = movablePieces;
     gameState.message = `${currentPlayer.name} rolled a ${diceValue}.`;
+    gameState.turn_history.push({ userId: currentPlayer.playerId, name: currentPlayer.name, description: `rolled a ${diceValue}.` });
+
 
     if (movablePieces.length === 0) {
         // Use a short delay before auto-advancing turn to let players see the roll.
@@ -250,6 +255,8 @@ function movePiece(gameState, playerId, pieceId) {
     
     pieceToMove.position = newPos;
     pieceToMove.state = newState;
+    gameState.turn_history.push({ userId: currentPlayer.playerId, name: currentPlayer.name, description: `moved piece to position ${newPos}.` });
+
 
     let capturedPiece = false;
     gameState.message = `${currentPlayer.name} moved a piece.`;
@@ -262,6 +269,7 @@ function movePiece(gameState, playerId, pieceId) {
                     oppPiece.state = PieceState.Home;
                     oppPiece.position = -1;
                     gameState.message = `${currentPlayer.name} captured ${opponent.name}'s piece!`;
+                    gameState.turn_history.push({ userId: currentPlayer.playerId, name: currentPlayer.name, description: `captured ${opponent.name}'s piece.` });
                     capturedPiece = true;
                 }
             });
@@ -275,6 +283,7 @@ function movePiece(gameState, playerId, pieceId) {
             gameState.winner = currentPlayer;
             gameState.gameStatus = GameStatus.Finished;
             gameState.message = `${currentPlayer.name} wins the game!`;
+            gameState.turn_history.push({ description: `Game finished. Winner: ${currentPlayer.name}` });
         } else {
              gameState.message = `${currentPlayer.name} has finished!`;
              advanceTurn(gameState);
@@ -298,6 +307,7 @@ function handleMissedTurn(gameState) {
 
     currentPlayer.inactiveTurns += 1;
     gameState.message = `${currentPlayer.name} missed their turn.`;
+    gameState.turn_history.push({ userId: currentPlayer.playerId, name: currentPlayer.name, description: `missed their turn.` });
 
     if (currentPlayer.inactiveTurns >= MAX_INACTIVE_TURNS) {
         leaveGame(gameState, currentPlayer.playerId);
@@ -328,6 +338,7 @@ function leaveGame(gameState, playerId) {
         player.isRemoved = true;
         player.disconnected = true;
         gameState.message = `${player.name} left the game.`;
+        gameState.turn_history.push({ userId: player.playerId, name: player.name, description: `left the game.` });
         
         // Check for win condition
         const activePlayers = gameState.players.filter(p => !p.isRemoved && !p.hasFinished);
@@ -335,6 +346,7 @@ function leaveGame(gameState, playerId) {
              gameState.winner = activePlayers[0];
              gameState.gameStatus = GameStatus.Finished;
              gameState.message = `${activePlayers[0].name} wins as the opponent left!`;
+             gameState.turn_history.push({ description: `Game finished. Winner: ${activePlayers[0].name}` });
         } else if (gameState.players[gameState.currentPlayerIndex].playerId === playerId) {
             advanceTurn(gameState);
         }
@@ -347,6 +359,7 @@ function sendChatMessage(gameState, playerId, text) {
 
     const message = {
         id: uuidv4(),
+        game_code: gameState.gameId, // Add game code for DB linking
         playerId,
         name: player.name,
         color: player.color,
