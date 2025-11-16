@@ -1,3 +1,4 @@
+
 // /dream-ludo-server/game.js
 const { v4: uuidv4 } = require('uuid');
 
@@ -106,9 +107,31 @@ function calculateMovablePieces(player, diceValue) {
 }
 
 /**
+ * Helper to log turn activity to both in-memory state and database.
+ */
+async function logTurnActivity(gameState, turnData, supabase) {
+    gameState.turn_history.push(turnData);
+
+    if (gameState.tournamentId && supabase) {
+        try {
+            const { error } = await supabase.from('game_turn_history').insert({
+                tournament_id: gameState.tournamentId,
+                user_id: turnData.userId,
+                username: turnData.name,
+                description: turnData.description,
+            });
+            if (error) console.error('Error saving turn history:', error.message);
+        } catch (e) {
+            console.error('Exception saving turn history:', e.message);
+        }
+    }
+}
+
+
+/**
  * Moves to the next active player.
  */
-function advanceTurn(gameState) {
+async function advanceTurn(gameState, supabase) {
     if (gameState.gameStatus !== GameStatus.Playing) return;
     
     // Reset current player's inactive turns since they made a move
@@ -119,7 +142,6 @@ function advanceTurn(gameState) {
     let nextIndex = (gameState.currentPlayerIndex + 1) % gameState.players.length;
     let checkedAll = 0;
     
-    // Skip players who have finished, been removed, or are disconnected
     while (
         (gameState.players[nextIndex].hasFinished || gameState.players[nextIndex].isRemoved || gameState.players[nextIndex].disconnected) && 
         checkedAll < gameState.players.length
@@ -128,13 +150,12 @@ function advanceTurn(gameState) {
         checkedAll++;
     }
 
-    // If all remaining players have finished or left, end the game.
     const activePlayers = gameState.players.filter(p => !p.isRemoved && !p.hasFinished);
     if (activePlayers.length <= 1 && gameState.players.length > 1) {
         gameState.gameStatus = GameStatus.Finished;
-        gameState.winner = activePlayers[0] || null; // The last one standing is the winner
+        gameState.winner = activePlayers[0] || null;
         gameState.message = "Game Over!";
-        gameState.turn_history.push({ description: `Game finished. Winner: ${gameState.winner?.name || 'None'}` });
+        await logTurnActivity(gameState, { description: `Game finished. Winner: ${gameState.winner?.name || 'None'}` }, supabase);
         return;
     }
 
@@ -152,13 +173,14 @@ function advanceTurn(gameState) {
  * Creates a new game state object.
  */
 function createNewGame(gameId, options = {}) {
-  const { hostId, hostName, type = 'manual', max_players = 2, players: initialPlayers = [] } = options;
+  const { hostId, hostName, type = 'manual', max_players = 2, players: initialPlayers = [], tournamentId } = options;
   
   const gameState = {
     gameId,
     hostId,
     type,
     max_players,
+    tournamentId,
     players: [],
     playerOrder: [],
     currentPlayerIndex: 0,
@@ -184,7 +206,7 @@ function createNewGame(gameId, options = {}) {
 function addPlayer(gameState, playerId, playerName) {
     if (gameState.gameStatus !== GameStatus.Setup) return;
     if (gameState.players.length >= gameState.max_players) return;
-    if (gameState.players.some(p => p.playerId === playerId)) return; // Already in game
+    if (gameState.players.some(p => p.playerId === playerId)) return;
 
     const isHost = gameState.players.length === 0;
     const color = ALL_COLORS[gameState.players.length];
@@ -197,7 +219,7 @@ function addPlayer(gameState, playerId, playerName) {
 /**
  * Starts the game, sets player order, and begins the first turn.
  */
-function startGame(gameState, requestingPlayerId) {
+async function startGame(gameState, requestingPlayerId, supabase) {
     if (requestingPlayerId && gameState.hostId !== requestingPlayerId) {
         gameState.message = "Only the host can start the game.";
         return;
@@ -212,7 +234,7 @@ function startGame(gameState, requestingPlayerId) {
     gameState.currentPlayerIndex = 0;
     gameState.turnTimeLeft = TURN_TIME_LIMIT;
     gameState.message = `Game started! ${gameState.players[0].name}'s turn.`;
-    gameState.turn_history.push({ description: 'Game started.' });
+    await logTurnActivity(gameState, { description: 'Game started.' }, supabase);
 }
 
 function initiateRoll(gameState, playerId) {
@@ -222,7 +244,7 @@ function initiateRoll(gameState, playerId) {
     gameState.message = `${currentPlayer.name} is rolling...`;
 }
 
-function completeRoll(gameState, playerId) {
+async function completeRoll(gameState, playerId, supabase) {
     const currentPlayer = gameState.players[gameState.currentPlayerIndex];
     if (currentPlayer.playerId !== playerId || !gameState.isRolling) return;
 
@@ -233,18 +255,16 @@ function completeRoll(gameState, playerId) {
     const movablePieces = calculateMovablePieces(currentPlayer, diceValue);
     gameState.movablePieces = movablePieces;
     gameState.message = `${currentPlayer.name} rolled a ${diceValue}.`;
-    gameState.turn_history.push({ userId: currentPlayer.playerId, name: currentPlayer.name, description: `rolled a ${diceValue}.` });
+    await logTurnActivity(gameState, { userId: currentPlayer.playerId, name: currentPlayer.name, description: `rolled a ${diceValue}.` }, supabase);
 
 
     if (movablePieces.length === 0) {
-        // Use a short delay before auto-advancing turn to let players see the roll.
-        // The server will handle this with a timeout.
-        return true; // Indicates that the turn should advance
+        return true; 
     }
     return false;
 }
 
-function movePiece(gameState, playerId, pieceId) {
+async function movePiece(gameState, playerId, pieceId, supabase) {
     const currentPlayer = gameState.players[gameState.currentPlayerIndex];
     if (currentPlayer.playerId !== playerId || !gameState.movablePieces.includes(pieceId)) return;
 
@@ -255,25 +275,25 @@ function movePiece(gameState, playerId, pieceId) {
     
     pieceToMove.position = newPos;
     pieceToMove.state = newState;
-    gameState.turn_history.push({ userId: currentPlayer.playerId, name: currentPlayer.name, description: `moved piece to position ${newPos}.` });
+    await logTurnActivity(gameState, { userId: currentPlayer.playerId, name: currentPlayer.name, description: `moved piece to position ${newPos}.` }, supabase);
 
 
     let capturedPiece = false;
     gameState.message = `${currentPlayer.name} moved a piece.`;
 
     if (newState === PieceState.Active && newPos < FINISH_POSITION_START && !SAFE_SPOTS.includes(newPos)) {
-        gameState.players.forEach(opponent => {
-            if (opponent.color === currentPlayer.color) return;
-            opponent.pieces.forEach(oppPiece => {
+        for (const opponent of gameState.players) {
+            if (opponent.color === currentPlayer.color) continue;
+            for (const oppPiece of opponent.pieces) {
                 if (oppPiece.position === newPos) {
                     oppPiece.state = PieceState.Home;
                     oppPiece.position = -1;
                     gameState.message = `${currentPlayer.name} captured ${opponent.name}'s piece!`;
-                    gameState.turn_history.push({ userId: currentPlayer.playerId, name: currentPlayer.name, description: `captured ${opponent.name}'s piece.` });
+                    await logTurnActivity(gameState, { userId: currentPlayer.playerId, name: currentPlayer.name, description: `captured ${opponent.name}'s piece.` }, supabase);
                     capturedPiece = true;
                 }
-            });
-        });
+            }
+        }
     }
 
     if (currentPlayer.pieces.every(p => p.state === PieceState.Finished)) {
@@ -283,10 +303,10 @@ function movePiece(gameState, playerId, pieceId) {
             gameState.winner = currentPlayer;
             gameState.gameStatus = GameStatus.Finished;
             gameState.message = `${currentPlayer.name} wins the game!`;
-            gameState.turn_history.push({ description: `Game finished. Winner: ${currentPlayer.name}` });
+            await logTurnActivity(gameState, { description: `Game finished. Winner: ${currentPlayer.name}` }, supabase);
         } else {
              gameState.message = `${currentPlayer.name} has finished!`;
-             advanceTurn(gameState);
+             await advanceTurn(gameState, supabase);
         }
         return;
     }
@@ -297,22 +317,22 @@ function movePiece(gameState, playerId, pieceId) {
         gameState.message += " Roll again!";
         gameState.turnTimeLeft = TURN_TIME_LIMIT;
     } else {
-        advanceTurn(gameState);
+        await advanceTurn(gameState, supabase);
     }
 }
 
-function handleMissedTurn(gameState) {
+async function handleMissedTurn(gameState, supabase) {
     const currentPlayer = gameState.players[gameState.currentPlayerIndex];
     if (!currentPlayer || gameState.gameStatus !== GameStatus.Playing) return;
 
     currentPlayer.inactiveTurns += 1;
     gameState.message = `${currentPlayer.name} missed their turn.`;
-    gameState.turn_history.push({ userId: currentPlayer.playerId, name: currentPlayer.name, description: `missed their turn.` });
+    await logTurnActivity(gameState, { userId: currentPlayer.playerId, name: currentPlayer.name, description: `missed their turn.` }, supabase);
 
     if (currentPlayer.inactiveTurns >= MAX_INACTIVE_TURNS) {
-        leaveGame(gameState, currentPlayer.playerId);
+        await leaveGame(gameState, currentPlayer.playerId, supabase);
     } else {
-        advanceTurn(gameState);
+        await advanceTurn(gameState, supabase);
     }
 }
 
@@ -332,34 +352,33 @@ function handlePlayerReconnect(gameState, playerId) {
     }
 }
 
-function leaveGame(gameState, playerId) {
+async function leaveGame(gameState, playerId, supabase) {
     const player = gameState.players.find(p => p.playerId === playerId);
     if (player && !player.isRemoved) {
         player.isRemoved = true;
         player.disconnected = true;
         gameState.message = `${player.name} left the game.`;
-        gameState.turn_history.push({ userId: player.playerId, name: player.name, description: `left the game.` });
+        await logTurnActivity(gameState, { userId: player.playerId, name: player.name, description: `left the game.` }, supabase);
         
-        // Check for win condition
         const activePlayers = gameState.players.filter(p => !p.isRemoved && !p.hasFinished);
         if (activePlayers.length === 1 && gameState.players.length > 1) {
              gameState.winner = activePlayers[0];
              gameState.gameStatus = GameStatus.Finished;
              gameState.message = `${activePlayers[0].name} wins as the opponent left!`;
-             gameState.turn_history.push({ description: `Game finished. Winner: ${activePlayers[0].name}` });
+             await logTurnActivity(gameState, { description: `Game finished. Winner: ${activePlayers[0].name}` }, supabase);
         } else if (gameState.players[gameState.currentPlayerIndex].playerId === playerId) {
-            advanceTurn(gameState);
+            await advanceTurn(gameState, supabase);
         }
     }
 }
 
-function sendChatMessage(gameState, playerId, text) {
+async function sendChatMessage(gameState, playerId, text, supabase) {
     const player = gameState.players.find(p => p.playerId === playerId);
     if (!player) return;
 
     const message = {
         id: uuidv4(),
-        game_code: gameState.gameId, // Add game code for DB linking
+        game_code: gameState.gameId,
         playerId,
         name: player.name,
         color: player.color,
@@ -370,6 +389,20 @@ function sendChatMessage(gameState, playerId, text) {
     if (!gameState.chatMessages) gameState.chatMessages = [];
     gameState.chatMessages.push(message);
     if (gameState.chatMessages.length > 50) gameState.chatMessages.shift();
+    
+    if (gameState.tournamentId && supabase) {
+        try {
+            const { error } = await supabase.from('chat_messages').insert({
+                tournament_id: gameState.tournamentId,
+                user_id: playerId,
+                username: player.name,
+                message_text: text,
+            });
+            if (error) console.error('Error saving chat message:', error.message);
+        } catch(e) {
+            console.error('Exception saving chat message:', e.message);
+        }
+    }
 }
 
 module.exports = {
