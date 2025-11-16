@@ -1,3 +1,4 @@
+
 // /dream-ludo-server/server.js
 require('dotenv').config();
 const express = require('express');
@@ -21,7 +22,6 @@ if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !SUPABASE_JWT_SECRET) {
     process.exit(1);
 }
 
-// The supabase client requires a service_role key to bypass RLS for server-side operations.
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY || SUPABASE_ANON_KEY);
 const games = new Map(); // In-memory storage for active games
 const RECONNECT_GRACE_PERIOD = 30000; // 30 seconds
@@ -35,10 +35,6 @@ app.get('/health', (req, res) => res.send('OK'));
 // --- WebSocket Server Logic ---
 wss.on('connection', async (ws, req) => {
     const gameCode = req.url.slice(1).toUpperCase();
-    
-    // The logic to fetch completed/archived games from a different table has been removed
-    // as it created complexity. Clients will now just see a "Game not found" error if
-    // the game is over and removed from memory, which is a simpler and acceptable flow.
     
     if (!games.has(gameCode)) {
         try {
@@ -62,6 +58,7 @@ wss.on('connection', async (ws, req) => {
                 hostId: tournament.players_joined[0]?.id,
                 type: 'tournament',
                 max_players: tournament.max_players,
+                tournamentId: tournament.id,
             };
 
             const gameState = createNewGame(gameCode, gameOptions);
@@ -108,8 +105,8 @@ wss.on('connection', async (ws, req) => {
                 broadcastGameState(gameCode);
                 
                 if (game.state.type === 'tournament' && game.state.players.length === game.state.max_players && game.state.gameStatus === 'Setup') {
-                    setTimeout(() => {
-                        startGame(game.state, null);
+                    setTimeout(async () => {
+                        await startGame(game.state, null, supabase);
                         broadcastGameState(gameCode);
                         startTurnTimer(gameCode);
                     }, 1500);
@@ -127,17 +124,17 @@ wss.on('connection', async (ws, req) => {
 
             switch (action) {
                 case 'START_GAME':
-                    startGame(game.state, ws.userId);
+                    await startGame(game.state, ws.userId, supabase);
                     startTurnTimer(gameCode);
                     break;
                 case 'ROLL_DICE':
                     initiateRoll(game.state, ws.userId);
                     broadcastGameState(gameCode);
-                    setTimeout(() => {
-                        const shouldAdvance = completeRoll(game.state, ws.userId);
+                    setTimeout(async () => {
+                        const shouldAdvance = await completeRoll(game.state, ws.userId, supabase);
                         if (shouldAdvance) {
-                            setTimeout(() => {
-                                advanceTurn(game.state);
+                            setTimeout(async () => {
+                                await advanceTurn(game.state, supabase);
                                 broadcastGameState(gameCode);
                                 startTurnTimer(gameCode);
                             }, 1000);
@@ -145,10 +142,18 @@ wss.on('connection', async (ws, req) => {
                            broadcastGameState(gameCode);
                         }
                     }, 1000);
-                    return;
-                case 'MOVE_PIECE': movePiece(game.state, ws.userId, payload.pieceId); startTurnTimer(gameCode); break;
-                case 'LEAVE_GAME': leaveGame(game.state, ws.userId); startTurnTimer(gameCode); break;
-                case 'SEND_CHAT_MESSAGE': sendChatMessage(game.state, ws.userId, payload.text); break;
+                    return; // Return to prevent duplicate broadcast
+                case 'MOVE_PIECE': 
+                    await movePiece(game.state, ws.userId, payload.pieceId, supabase); 
+                    startTurnTimer(gameCode); 
+                    break;
+                case 'LEAVE_GAME': 
+                    await leaveGame(game.state, ws.userId, supabase); 
+                    startTurnTimer(gameCode); 
+                    break;
+                case 'SEND_CHAT_MESSAGE': 
+                    await sendChatMessage(game.state, ws.userId, payload.text, supabase); 
+                    break;
                 default: return;
             }
 
@@ -173,10 +178,10 @@ wss.on('connection', async (ws, req) => {
             handlePlayerDisconnect(game.state, ws.userId);
             broadcastGameState(gameCode);
 
-            const reconnectTimer = setTimeout(() => {
+            const reconnectTimer = setTimeout(async () => {
                 const game = games.get(gameCode);
                 if (game) {
-                    leaveGame(game.state, ws.userId);
+                    await leaveGame(game.state, ws.userId, supabase);
                     broadcastGameState(gameCode);
                     if (game.state.gameStatus === 'Finished') {
                         handleGameFinish(gameCode);
@@ -204,17 +209,17 @@ function startTurnTimer(gameCode) {
     clearTimeout(game.turnTimer);
     game.state.turnTimeLeft = 30;
 
-    const timerTick = () => {
-        if (game.state.gameStatus !== 'Playing') return;
+    const timerTick = async () => {
+        if (!games.has(gameCode) || games.get(gameCode).state.gameStatus !== 'Playing') return;
         
         game.state.turnTimeLeft--;
         if (game.state.turnTimeLeft <= 0) {
-            handleMissedTurn(game.state);
+            await handleMissedTurn(game.state, supabase);
             broadcastGameState(gameCode);
             if (game.state.gameStatus === 'Finished') {
                 handleGameFinish(gameCode);
             } else {
-                startTurnTimer(gameCode); // Start timer for the next player
+                startTurnTimer(gameCode);
             }
         } else {
             game.turnTimer = setTimeout(timerTick, 1000);
@@ -225,60 +230,19 @@ function startTurnTimer(gameCode) {
 }
 
 async function archiveGameData(gameCode) {
-    const game = games.get(gameCode);
-    if (!game) return;
-
-    const { state: finalState } = game;
-    const { data: tournament, error: findError } = await supabase
-        .from('tournaments')
-        .select('id')
-        .eq('game_code', gameCode)
-        .single();
-        
-    if (findError || !tournament) {
-        console.error(`Could not find tournament ID for game code ${gameCode}:`, findError);
-        return;
-    }
-    const tournamentId = tournament.id;
-
-    // Archive chat messages
-    if (finalState.chatMessages && finalState.chatMessages.length > 0) {
-        const chatToInsert = finalState.chatMessages.map(msg => ({
-            tournament_id: tournamentId,
-            user_id: msg.playerId,
-            username: msg.name,
-            message_text: msg.text,
-        }));
-        const { error: chatError } = await supabase.from('chat_messages').insert(chatToInsert);
-        if (chatError) console.error(`Failed to archive chat for ${gameCode}:`, chatError);
-    }
-
-    // Archive turn history
-    if (finalState.turn_history && finalState.turn_history.length > 0) {
-        const turnsToInsert = finalState.turn_history.map(turn => ({
-            tournament_id: tournamentId,
-            user_id: turn.userId,
-            username: turn.name,
-            description: turn.description,
-        }));
-        const { error: turnError } = await supabase.from('game_turn_history').insert(turnsToInsert);
-        if (turnError) console.error(`Failed to archive turns for ${gameCode}:`, turnError);
-    }
+    // This function is now OBSOLETE as data is saved in real-time.
+    // Kept here to avoid breaking the call in handleGameFinish, but it does nothing.
+    return;
 }
 
 async function handleGameFinish(gameCode) {
     const game = games.get(gameCode);
     if (!game) return;
 
-    console.log(`Game ${gameCode} finished. Archiving to database.`);
+    console.log(`Game ${gameCode} finished.`);
     clearTimeout(game.turnTimer);
     game.turnTimer = null;
-
-    // Persist chat and turn history
-    await archiveGameData(gameCode);
-
-    // After archiving, we can remove the game from memory.
-    // The main game flow will handle tournament status updates via RPCs.
+    
     setTimeout(() => {
         games.delete(gameCode);
         console.log(`Game ${gameCode} removed from memory.`);
