@@ -47,12 +47,6 @@ wss.on('connection', async (ws, req) => {
                 .single();
 
             if (tournamentError || !tournament) {
-                // If the game is finished, fetch the archived state for viewing.
-                if (tournament && (tournament.status === 'COMPLETED' || tournament.status === 'CANCELLED')) {
-                    ws.send(JSON.stringify({ type: 'GAME_ARCHIVED', payload: { gameId: gameCode, gameStatus: 'Finished', winner: null, players: tournament.players_joined.map((p, i) => ({...p, playerId: p.id, color: ['Red', 'Green', 'Blue', 'Yellow'][i]})) } }));
-                    ws.close(1000, 'Game already finished.');
-                    return;
-                }
                 ws.close(1011, 'Game not found.');
                 return;
             }
@@ -67,7 +61,6 @@ wss.on('connection', async (ws, req) => {
                 type: 'tournament',
                 max_players: tournament.max_players,
                 tournamentId: tournament.id,
-                players: tournament.players_joined,
             };
 
             const gameState = createNewGame(gameCode, gameOptions);
@@ -145,8 +138,7 @@ wss.on('connection', async (ws, req) => {
                             setTimeout(async () => {
                                 await advanceTurn(game.state, supabase);
                                 broadcastGameState(gameCode);
-                                if (game.state.gameStatus === 'Finished') handleGameFinish(gameCode);
-                                else startTurnTimer(gameCode);
+                                startTurnTimer(gameCode);
                             }, 1000);
                         } else {
                            broadcastGameState(gameCode);
@@ -220,54 +212,29 @@ function startTurnTimer(gameCode) {
     game.state.turnTimeLeft = 30;
 
     const timerTick = async () => {
-        const currentGame = games.get(gameCode);
-        if (!currentGame || currentGame.state.gameStatus !== 'Playing') return;
+        if (!games.has(gameCode) || games.get(gameCode).state.gameStatus !== 'Playing') return;
         
-        currentGame.state.turnTimeLeft--;
-        if (currentGame.state.turnTimeLeft <= 0) {
-            await handleMissedTurn(currentGame.state, supabase);
+        game.state.turnTimeLeft--;
+        if (game.state.turnTimeLeft <= 0) {
+            await handleMissedTurn(game.state, supabase);
             broadcastGameState(gameCode);
-            if (currentGame.state.gameStatus === 'Finished') {
+            if (game.state.gameStatus === 'Finished') {
                 handleGameFinish(gameCode);
             } else {
                 startTurnTimer(gameCode);
             }
         } else {
-            currentGame.turnTimer = setTimeout(timerTick, 1000);
-            if(currentGame.state.turnTimeLeft % 5 === 0) broadcastGameState(gameCode);
+            game.turnTimer = setTimeout(timerTick, 1000);
+            if(game.state.turnTimeLeft % 5 === 0) broadcastGameState(gameCode);
         }
     };
     game.turnTimer = setTimeout(timerTick, 1000);
 }
 
-async function finalizeTournamentOnServer(gameState) {
-    if (!gameState || !gameState.tournamentId || !gameState.winner) {
-        console.log(`[FINALIZE] Skipping result: Not a tournament game or no winner determined. GameCode: ${gameState.gameId}`);
-        return;
-    }
-
-    const { tournamentId, winner } = gameState;
-    const winnerId = winner.playerId;
-
-    console.log(`[FINALIZE] Attempting to finalize tournament ${tournamentId} with winner ${winner.name} (${winnerId})`);
-
-    try {
-        const { data, error } = await supabase.rpc('server_finalize_tournament', {
-            p_tournament_id: tournamentId,
-            p_winner_id: winnerId
-        });
-        
-        if (error) throw error;
-
-        if (typeof data === 'string' && data.startsWith('Error:')) {
-            console.warn(`[FINALIZE] RPC error for tournament ${tournamentId}:`, data);
-        } else {
-            console.log(`[FINALIZE] Successfully finalized tournament ${tournamentId}. Server response: ${data}`);
-        }
-
-    } catch (err) {
-        console.error(`[FINALIZE] CRITICAL: Failed to call RPC for tournament ${tournamentId}.`, err);
-    }
+async function archiveGameData(gameCode) {
+    // This function is now OBSOLETE as data is saved in real-time.
+    // Kept here to avoid breaking the call in handleGameFinish, but it does nothing.
+    return;
 }
 
 async function handleGameFinish(gameCode) {
@@ -278,12 +245,6 @@ async function handleGameFinish(gameCode) {
     clearTimeout(game.turnTimer);
     game.turnTimer = null;
     
-    // Finalize the result in Supabase
-    if (game.state.winner && game.state.type === 'tournament') {
-        finalizeTournamentOnServer(game.state);
-    }
-    
-    // Delay before removing the game from memory to allow final state broadcast
     setTimeout(() => {
         games.delete(gameCode);
         console.log(`Game ${gameCode} removed from memory.`);
