@@ -121,7 +121,7 @@ wss.on('connection', async (ws, req) => {
             const player = game.state.players.find(p => p.playerId === ws.userId);
             if (!player || player.isRemoved) return;
 
-            if (game.state.players[game.state.currentPlayerIndex].playerId === ws.userId) {
+            if (game.state.players[gameState.currentPlayerIndex].playerId === ws.userId) {
                 startTurnTimer(gameCode);
             }
 
@@ -133,21 +133,32 @@ wss.on('connection', async (ws, req) => {
                 case 'ROLL_DICE':
                     initiateRoll(game.state, ws.userId);
                     broadcastGameState(gameCode); // Broadcast 1: Show rolling animation
-                    setTimeout(async () => {
-                        const shouldAdvance = await completeRoll(game.state, ws.userId, supabase);
-                        broadcastGameState(gameCode); // Broadcast 2: Show the dice result to the user.
+                    setTimeout(() => { // Outer setTimeout for rolling animation
+                        (async () => { // Use an async IIFE to handle promise rejections
+                            try {
+                                const shouldAdvance = await completeRoll(game.state, ws.userId, supabase);
+                                broadcastGameState(gameCode); // Broadcast 2: Show the dice result
 
-                        if (shouldAdvance) {
-                            // If no moves are possible, wait a moment for the user to see the roll, then advance.
-                            setTimeout(async () => {
-                                await advanceTurn(game.state, supabase);
-                                broadcastGameState(gameCode); // Broadcast 3: Clear dice and move to next player.
-                                startTurnTimer(gameCode);
-                            }, 1000); 
-                        }
-                        // If moves are possible (shouldAdvance is false), do nothing and wait for MOVE_PIECE action.
-                    }, 1000); // This delay is for the "rolling" animation.
-                    return; // Return to prevent duplicate broadcast at the end of the switch.
+                                if (shouldAdvance) {
+                                    // If no moves are possible, wait for user to see the roll, then advance.
+                                    setTimeout(() => {
+                                        (async () => {
+                                            try {
+                                                await advanceTurn(game.state, supabase);
+                                                broadcastGameState(gameCode); // Broadcast 3: Next turn
+                                                startTurnTimer(gameCode);
+                                            } catch (e) {
+                                                console.error("Error during auto-advance turn:", e);
+                                            }
+                                        })();
+                                    }, 1000);
+                                }
+                            } catch (e) {
+                                console.error("Error during dice roll completion:", e);
+                            }
+                        })();
+                    }, 1000);
+                    return; // Prevent duplicate broadcast
                 case 'MOVE_PIECE': 
                     await movePiece(game.state, ws.userId, payload.pieceId, supabase); 
                     startTurnTimer(gameCode); 
@@ -202,30 +213,31 @@ function startTurnTimer(gameCode) {
     clearTimeout(game.turnTimer);
     game.state.turnTimeLeft = 30;
 
-    const timerTick = async () => {
-        if (!games.has(gameCode) || games.get(gameCode).state.gameStatus !== 'Playing') return;
-        
-        game.state.turnTimeLeft--;
-        if (game.state.turnTimeLeft <= 0) {
-            await handleMissedTurn(game.state, supabase);
-            broadcastGameState(gameCode);
-            if (game.state.gameStatus === 'Finished') {
-                handleGameFinish(gameCode);
-            } else {
-                startTurnTimer(gameCode);
+    const timerTick = () => { // Not async
+        (async () => { // Wrapped in async IIFE with try/catch
+            try {
+                const currentGame = games.get(gameCode); // Re-fetch game to be safe
+                if (!currentGame || currentGame.state.gameStatus !== 'Playing') return;
+                
+                currentGame.state.turnTimeLeft--;
+                if (currentGame.state.turnTimeLeft <= 0) {
+                    await handleMissedTurn(currentGame.state, supabase);
+                    broadcastGameState(gameCode);
+                    if (currentGame.state.gameStatus === 'Finished') {
+                        handleGameFinish(gameCode);
+                    } else {
+                        startTurnTimer(gameCode);
+                    }
+                } else {
+                    currentGame.turnTimer = setTimeout(timerTick, 1000);
+                    if (currentGame.state.turnTimeLeft % 5 === 0) broadcastGameState(gameCode);
+                }
+            } catch (e) {
+                console.error('Error in turn timer tick:', e);
             }
-        } else {
-            game.turnTimer = setTimeout(timerTick, 1000);
-            if(game.state.turnTimeLeft % 5 === 0) broadcastGameState(gameCode);
-        }
+        })();
     };
     game.turnTimer = setTimeout(timerTick, 1000);
-}
-
-async function archiveGameData(gameCode) {
-    // This function is now OBSOLETE as data is saved in real-time.
-    // Kept here to avoid breaking the call in handleGameFinish, but it does nothing.
-    return;
 }
 
 async function handleGameFinish(gameCode) {
