@@ -131,11 +131,6 @@ async function logTurnActivity(gameState, turnData, supabase) {
  */
 async function advanceTurn(gameState, supabase) {
     if (gameState.gameStatus !== GameStatus.Playing) return;
-    
-    // Reset current player's inactive turns since they made a move
-    if (gameState.players[gameState.currentPlayerIndex]) {
-        gameState.players[gameState.currentPlayerIndex].inactiveTurns = 0;
-    }
 
     let nextIndex = (gameState.currentPlayerIndex + 1) % gameState.players.length;
     let checkedAll = 0;
@@ -247,6 +242,8 @@ function initiateRoll(gameState, playerId) {
 async function completeRoll(gameState, playerId, supabase) {
     const currentPlayer = gameState.players[gameState.currentPlayerIndex];
     if (currentPlayer.playerId !== playerId || !gameState.isRolling) return;
+    
+    currentPlayer.inactiveTurns = 0; // Player took an action, reset counter.
 
     const diceValue = Math.floor(Math.random() * 6) + 1;
     gameState.diceValue = diceValue;
@@ -267,6 +264,8 @@ async function completeRoll(gameState, playerId, supabase) {
 async function movePiece(gameState, playerId, pieceId, supabase) {
     const currentPlayer = gameState.players[gameState.currentPlayerIndex];
     if (currentPlayer.playerId !== playerId || !gameState.movablePieces.includes(pieceId)) return;
+
+    currentPlayer.inactiveTurns = 0; // Player took an action, reset counter.
 
     const pieceToMove = currentPlayer.pieces.find(p => p.id === pieceId);
     if (!pieceToMove) return;
