@@ -112,7 +112,7 @@ wss.on('connection', async (ws, req) => {
                         await startGame(game.state, null, supabase);
                         broadcastGameState(gameCode);
                         startTurnTimer(gameCode);
-                    }, 1500);
+                    }, 10000);
                 }
                 return;
             }
