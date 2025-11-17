@@ -1,285 +1,404 @@
-// /dream-ludo-server/server.js
-require('dotenv').config();
-const express = require('express');
-const { createServer } = require('http');
-const { WebSocketServer } = require('ws');
-const { createClient } = require('@supabase/supabase-js');
+// /dream-ludo-server/game.js
+const { v4: uuidv4 } = require('uuid');
 
-const {
+// --- Enums and Constants (mirrored from frontend) ---
+const PlayerColor = { Red: 'Red', Green: 'Green', Blue: 'Blue', Yellow: 'Yellow' };
+const PieceState = { Home: 'Home', Active: 'Active', Finished: 'Finished' };
+const GameStatus = { Setup: 'Setup', Playing: 'Playing', Finished: 'Finished' };
+
+const TOTAL_PATH_LENGTH = 52;
+const HOME_STRETCH_LENGTH = 6;
+const FINISH_POSITION_START = 100;
+const TURN_TIME_LIMIT = 30;
+const MAX_INACTIVE_TURNS = 5; // UPDATED: Changed from 3 to 5
+
+const START_POSITIONS = {
+  [PlayerColor.Green]: 1,
+  [PlayerColor.Red]: 14,
+  [PlayerColor.Yellow]: 40,
+  [PlayerColor.Blue]: 27,
+};
+
+const PRE_HOME_POSITIONS = {
+  [PlayerColor.Green]: 51,
+  [PlayerColor.Red]: 12,
+  [PlayerColor.Yellow]: 38,
+  [PlayerColor.Blue]: 25,
+};
+
+const SAFE_SPOTS = [1, 9, 14, 22, 27, 35, 40, 48];
+const ALL_COLORS = [PlayerColor.Red, PlayerColor.Green, PlayerColor.Blue, PlayerColor.Yellow];
+const TWO_PLAYER_COLORS = [PlayerColor.Green, PlayerColor.Blue];
+
+// --- Helper Functions ---
+
+/**
+ * Creates the initial state for a single player.
+ */
+function createPlayer(playerId, name, color, isHost = false) {
+  const pieces = Array.from({ length: 4 }, (_, i) => ({
+    id: ALL_COLORS.indexOf(color) * 4 + i,
+    color: color,
+    state: PieceState.Home,
+    position: -1,
+  }));
+  return {
+    playerId,
+    name,
+    color,
+    pieces,
+    isHost,
+    hasFinished: false,
+    isRemoved: false,
+    inactiveTurns: 0,
+  };
+}
+
+/**
+ * Calculates the new position of a piece after a move.
+ */
+function getNewPositionInfo(piece, diceValue) {
+    if (piece.state === PieceState.Home && diceValue === 6) {
+        return { position: START_POSITIONS[piece.color], state: PieceState.Active };
+    }
+
+    if (piece.state === PieceState.Active) {
+        let newPos;
+        if (piece.position >= FINISH_POSITION_START) { // Already in home stretch
+            newPos = piece.position + diceValue;
+            if (newPos === FINISH_POSITION_START + HOME_STRETCH_LENGTH - 1) return { position: newPos, state: PieceState.Finished };
+            if (newPos < FINISH_POSITION_START + HOME_STRETCH_LENGTH) return { position: newPos, state: PieceState.Active };
+        } else { // On main path
+            const preHomePos = PRE_HOME_POSITIONS[piece.color];
+            // Calculate distance to the entry of the home stretch
+            const distToPreHome = (preHomePos - piece.position + TOTAL_PATH_LENGTH) % TOTAL_PATH_LENGTH;
+            if (diceValue > distToPreHome) { // Will enter home stretch
+                const homeStretchPos = diceValue - distToPreHome - 1;
+                if (homeStretchPos < HOME_STRETCH_LENGTH) {
+                    newPos = FINISH_POSITION_START + homeStretchPos;
+                    if (homeStretchPos === HOME_STRETCH_LENGTH - 1) return { position: newPos, state: PieceState.Finished };
+                    return { position: newPos, state: PieceState.Active };
+                }
+            } else { // Stays on main path (using clearer 0-based calculation)
+                const zeroBasedPos = piece.position - 1;
+                const newZeroBasedPos = (zeroBasedPos + diceValue) % TOTAL_PATH_LENGTH;
+                newPos = newZeroBasedPos + 1;
+                return { position: newPos, state: PieceState.Active };
+            }
+        }
+    }
+    return { position: piece.position, state: piece.state }; // Invalid move
+}
+
+
+/**
+ * Finds which pieces can legally move given a dice roll.
+ */
+function calculateMovablePieces(player, diceValue) {
+    const movable = [];
+    for (const piece of player.pieces) {
+        const { position: newPos, state: newState } = getNewPositionInfo(piece, diceValue);
+        if (newState !== piece.state || newPos !== piece.position) {
+            movable.push(piece.id);
+        }
+    }
+    return movable;
+}
+
+/**
+ * Helper to log turn activity to both in-memory state and database.
+ */
+async function logTurnActivity(gameState, turnData, supabase) {
+    gameState.turn_history.push(turnData);
+
+    if (gameState.tournamentId && supabase) {
+        try {
+            const { error } = await supabase.from('game_turn_history').insert({
+                tournament_id: gameState.tournamentId,
+                user_id: turnData.userId,
+                username: turnData.name,
+                description: turnData.description,
+            });
+            if (error) console.error('Error saving turn history:', error.message);
+        } catch (e) {
+            console.error('Exception saving turn history:', e.message);
+        }
+    }
+}
+
+
+/**
+ * Moves to the next active player.
+ */
+async function advanceTurn(gameState, supabase) {
+    if (gameState.gameStatus !== GameStatus.Playing) return;
+
+    let nextIndex = (gameState.currentPlayerIndex + 1) % gameState.players.length;
+    let checkedAll = 0;
+    
+    while (
+        (gameState.players[nextIndex].hasFinished || gameState.players[nextIndex].isRemoved) && 
+        checkedAll < gameState.players.length
+    ) {
+        nextIndex = (nextIndex + 1) % gameState.players.length;
+        checkedAll++;
+    }
+
+    // REMOVED: Auto-win logic when only one player is left.
+    // The game should only end when someone wins properly.
+    const activePlayers = gameState.players.filter(p => !p.isRemoved && !p.hasFinished);
+    if (activePlayers.length === 0 && gameState.players.length > 1) {
+        gameState.gameStatus = GameStatus.Finished;
+        gameState.winner = null; // No winner if all players leave
+        gameState.message = "Game Over! No active players left.";
+        await logTurnActivity(gameState, { description: `Game finished. No winner.` }, supabase);
+        return;
+    }
+
+    gameState.currentPlayerIndex = nextIndex;
+    gameState.diceValue = null;
+    gameState.isRolling = false;
+    gameState.movablePieces = [];
+    gameState.turnTimeLeft = TURN_TIME_LIMIT;
+    gameState.message = `${gameState.players[nextIndex].name}'s turn.`;
+}
+
+// --- Core Game Logic Functions ---
+
+/**
+ * Creates a new game state object.
+ */
+function createNewGame(gameId, options = {}) {
+  const { hostId, hostName, type = 'manual', max_players = 2, players: initialPlayers = [], tournamentId } = options;
+  
+  const gameState = {
+    gameId,
+    hostId,
+    type,
+    max_players,
+    tournamentId,
+    players: [],
+    playerOrder: [],
+    currentPlayerIndex: 0,
+    diceValue: null,
+    gameStatus: GameStatus.Setup,
+    winner: null,
+    message: 'Waiting for players...',
+    movablePieces: [],
+    isRolling: false,
+    turnTimeLeft: TURN_TIME_LIMIT,
+    chatMessages: [],
+    turn_history: [],
+  };
+
+  initialPlayers.forEach(p => addPlayer(gameState, p.id, p.name));
+  
+  return gameState;
+}
+
+/**
+ * Adds a new player to the game during setup.
+ */
+function addPlayer(gameState, playerId, playerName) {
+    if (gameState.gameStatus !== GameStatus.Setup) return;
+    if (gameState.players.length >= gameState.max_players) return;
+    if (gameState.players.some(p => p.playerId === playerId)) return;
+
+    const isHost = gameState.players.length === 0;
+    let color;
+    if (gameState.max_players === 2) {
+        color = TWO_PLAYER_COLORS[gameState.players.length];
+    } else {
+        color = ALL_COLORS[gameState.players.length];
+    }
+    const player = createPlayer(playerId, playerName, color, isHost);
+    
+    gameState.players.push(player);
+    gameState.message = `${playerName} joined the game!`;
+}
+
+/**
+ * Starts the game, sets player order, and begins the first turn.
+ */
+async function startGame(gameState, requestingPlayerId, supabase) {
+    if (requestingPlayerId && gameState.hostId !== requestingPlayerId) {
+        gameState.message = "Only the host can start the game.";
+        return;
+    }
+    if (gameState.gameStatus !== GameStatus.Setup || gameState.players.length < 2) {
+        gameState.message = "Need at least 2 players to start.";
+        return;
+    }
+
+    gameState.gameStatus = GameStatus.Playing;
+    gameState.playerOrder = gameState.players.map(p => p.color);
+    gameState.currentPlayerIndex = 0;
+    gameState.turnTimeLeft = TURN_TIME_LIMIT;
+    gameState.message = `Game started! ${gameState.players[0].name}'s turn.`;
+    await logTurnActivity(gameState, { description: 'Game started.' }, supabase);
+}
+
+function initiateRoll(gameState, playerId) {
+    const currentPlayer = gameState.players[gameState.currentPlayerIndex];
+    if (currentPlayer.playerId !== playerId || gameState.diceValue !== null || gameState.isRolling) return;
+    gameState.isRolling = true;
+    gameState.message = `${currentPlayer.name} is rolling...`;
+}
+
+async function completeRoll(gameState, playerId, supabase) {
+    const currentPlayer = gameState.players[gameState.currentPlayerIndex];
+    if (currentPlayer.playerId !== playerId || !gameState.isRolling) return;
+    
+    currentPlayer.inactiveTurns = 0; // Player took an action, reset counter.
+
+    const diceValue = Math.floor(Math.random() * 6) + 1;
+    gameState.diceValue = diceValue;
+    gameState.isRolling = false;
+    
+    const movablePieces = calculateMovablePieces(currentPlayer, diceValue);
+    gameState.movablePieces = movablePieces;
+    gameState.message = `${currentPlayer.name} rolled a ${diceValue}.`;
+    await logTurnActivity(gameState, { userId: currentPlayer.playerId, name: currentPlayer.name, description: `rolled a ${diceValue}.` }, supabase);
+
+
+    if (movablePieces.length === 0) {
+        return true; 
+    }
+    return false;
+}
+
+async function movePiece(gameState, playerId, pieceId, supabase) {
+    const currentPlayer = gameState.players[gameState.currentPlayerIndex];
+    if (currentPlayer.playerId !== playerId || !gameState.movablePieces.includes(pieceId)) return;
+
+    currentPlayer.inactiveTurns = 0; // Player took an action, reset counter.
+
+    const pieceToMove = currentPlayer.pieces.find(p => p.id === pieceId);
+    if (!pieceToMove) return;
+
+    const { position: newPos, state: newState } = getNewPositionInfo(pieceToMove, gameState.diceValue);
+    
+    pieceToMove.position = newPos;
+    pieceToMove.state = newState;
+    await logTurnActivity(gameState, { userId: currentPlayer.playerId, name: currentPlayer.name, description: `moved piece to position ${newPos}.` }, supabase);
+
+
+    let capturedPiece = false;
+    gameState.message = `${currentPlayer.name} moved a piece.`;
+
+    if (newState === PieceState.Active && newPos < FINISH_POSITION_START && !SAFE_SPOTS.includes(newPos)) {
+        for (const opponent of gameState.players) {
+            if (opponent.color === currentPlayer.color) continue;
+            for (const oppPiece of opponent.pieces) {
+                if (oppPiece.position === newPos) {
+                    oppPiece.state = PieceState.Home;
+                    oppPiece.position = -1;
+                    gameState.message = `${currentPlayer.name} captured ${opponent.name}'s piece!`;
+                    await logTurnActivity(gameState, { userId: currentPlayer.playerId, name: currentPlayer.name, description: `captured ${opponent.name}'s piece.` }, supabase);
+                    capturedPiece = true;
+                }
+            }
+        }
+    }
+
+    if (currentPlayer.pieces.every(p => p.state === PieceState.Finished)) {
+        currentPlayer.hasFinished = true;
+        // This is the only valid win condition now
+        gameState.winner = currentPlayer;
+        gameState.gameStatus = GameStatus.Finished;
+        gameState.message = `${currentPlayer.name} wins the game!`;
+        await logTurnActivity(gameState, { description: `Game finished. Winner: ${currentPlayer.name}` }, supabase);
+        return;
+    }
+
+    if (gameState.diceValue === 6 || capturedPiece) {
+        gameState.diceValue = null;
+        gameState.movablePieces = [];
+        gameState.message += " Roll again!";
+        gameState.turnTimeLeft = TURN_TIME_LIMIT;
+    } else {
+        await advanceTurn(gameState, supabase);
+    }
+}
+
+async function handleMissedTurn(gameState, supabase) {
+    const currentPlayer = gameState.players[gameState.currentPlayerIndex];
+    if (!currentPlayer || gameState.gameStatus !== GameStatus.Playing) return;
+
+    currentPlayer.inactiveTurns += 1;
+    gameState.message = `${currentPlayer.name} missed their turn.`;
+    await logTurnActivity(gameState, { userId: currentPlayer.playerId, name: currentPlayer.name, description: `missed their turn.` }, supabase);
+
+    if (currentPlayer.inactiveTurns >= MAX_INACTIVE_TURNS) {
+        await leaveGame(gameState, currentPlayer.playerId, supabase);
+    } else {
+        await advanceTurn(gameState, supabase);
+    }
+}
+
+async function leaveGame(gameState, playerId, supabase) {
+    const player = gameState.players.find(p => p.playerId === playerId);
+    if (player && !player.isRemoved) {
+        player.isRemoved = true;
+        gameState.message = `${player.name} left the game.`;
+        await logTurnActivity(gameState, { userId: player.playerId, name: player.name, description: `left the game.` }, supabase);
+        
+        // Check if there is only one active player left to declare a winner.
+        const activePlayers = gameState.players.filter(p => !p.isRemoved && !p.hasFinished);
+        if (activePlayers.length === 1) {
+            const winner = activePlayers[0];
+            gameState.winner = winner;
+            gameState.gameStatus = GameStatus.Finished;
+            gameState.message = `${winner.name} wins as the opponent left the game!`;
+            await logTurnActivity(gameState, { userId: winner.playerId, name: winner.name, description: `won because opponent left.` }, supabase);
+            return; // Game is over, no need to advance turn.
+        }
+        
+        if (gameState.players[gameState.currentPlayerIndex].playerId === playerId) {
+            await advanceTurn(gameState, supabase);
+        }
+    }
+}
+
+async function sendChatMessage(gameState, playerId, text, supabase) {
+    const player = gameState.players.find(p => p.playerId === playerId);
+    if (!player) return;
+
+    const message = {
+        id: uuidv4(),
+        game_code: gameState.gameId,
+        playerId,
+        name: player.name,
+        color: player.color,
+        text,
+        timestamp: Date.now(),
+    };
+
+    if (!gameState.chatMessages) gameState.chatMessages = [];
+    gameState.chatMessages.push(message);
+    if (gameState.chatMessages.length > 50) gameState.chatMessages.shift();
+    
+    // **DATABASE INSERTION LOGIC**
+    if (gameState.tournamentId && supabase) {
+        try {
+            const { error } = await supabase.from('chat_messages').insert({
+                tournament_id: gameState.tournamentId,
+                user_id: playerId,
+                username: player.name,
+                message_text: text,
+            });
+            if (error) {
+                console.error('Supabase error saving chat message:', error.message);
+            }
+        } catch(e) {
+            console.error('Exception while trying to save chat message:', e.message);
+        }
+    }
+}
+
+module.exports = {
     createNewGame, addPlayer, startGame,
     initiateRoll, completeRoll, movePiece,
     leaveGame, sendChatMessage, handleMissedTurn,
     advanceTurn
-} = require('./game');
-
-// --- Server & Supabase Setup ---
-const PORT = process.env.PORT || 8080;
-// **MODIFIED**: Now requires SUPABASE_SERVICE_KEY for admin operations.
-const { SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_KEY } = process.env;
-
-if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !SUPABASE_SERVICE_KEY) {
-    console.error("CRITICAL ERROR: One or more Supabase environment variables are missing.");
-    console.error("Ensure SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_SERVICE_KEY are set in your .env file.");
-    process.exit(1);
-}
-
-// **MODIFIED**: Initialize with the service key to bypass RLS for server operations.
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-const games = new Map(); // In-memory storage for active games
-
-const app = express();
-const server = createServer(app);
-const wss = new WebSocketServer({ server });
-
-app.get('/health', (req, res) => res.send('OK'));
-
-// --- WebSocket Server Logic ---
-wss.on('connection', async (ws, req) => {
-    const gameCode = req.url.slice(1).toUpperCase();
-    
-    if (!games.has(gameCode)) {
-        try {
-            const { data: tournament, error: tournamentError } = await supabase
-                .from('tournaments')
-                .select('*')
-                .eq('game_code', gameCode)
-                .single();
-
-            if (tournamentError || !tournament) {
-                ws.close(1011, 'Game not found.');
-                return;
-            }
-
-            if (tournament.status === 'COMPLETED') {
-                ws.send(JSON.stringify({ type: 'ERROR', payload: { message: 'This game has already been played.' } }));
-                ws.close(1011, 'Game already completed.');
-                return;
-            }
-
-            if (tournament.status !== 'ACTIVE') {
-                ws.close(1011, `Tournament is not active. Status: ${tournament.status}`);
-                return;
-            }
-            
-            const gameOptions = {
-                hostId: tournament.players_joined[0]?.id,
-                type: 'tournament',
-                max_players: tournament.max_players,
-                tournamentId: tournament.id,
-            };
-
-            const gameState = createNewGame(gameCode, gameOptions);
-            games.set(gameCode, { state: gameState, clients: new Map(), turnTimer: null });
-            console.log(`Game room created on-the-fly for tournament ${tournament.title} (${gameCode})`);
-
-        } catch (e) {
-            console.error(`Error validating game code ${gameCode}:`, e);
-            ws.close(1011, 'Server error validating game.');
-            return;
-        }
-    }
-
-    ws.on('message', async (message) => {
-        try {
-            const { action, payload } = JSON.parse(message);
-            const game = games.get(gameCode);
-            if (!game) return;
-
-            if (action === 'AUTH') {
-                const { data: { user }, error } = await supabase.auth.getUser(payload.token);
-                if (error || !user) {
-                    ws.send(JSON.stringify({ type: 'AUTH_FAILURE', payload: { message: 'Invalid token.' } }));
-                    ws.close(4001, 'Auth Failed');
-                    return;
-                }
-                
-                ws.userId = user.id;
-                ws.userName = user.user_metadata.full_name || 'Player';
-                ws.gameCode = gameCode;
-                
-                game.clients.set(ws.userId, ws);
-
-                const existingPlayer = game.state.players.find(p => p.playerId === ws.userId);
-                 if (!existingPlayer) {
-                    addPlayer(game.state, ws.userId, ws.userName);
-                }
-
-                ws.send(JSON.stringify({ type: 'AUTH_SUCCESS' }));
-                broadcastGameState(gameCode);
-                
-                if (game.state.type === 'tournament' && game.state.players.length === game.state.max_players && game.state.gameStatus === 'Setup') {
-                    setTimeout(async () => {
-                        await startGame(game.state, null, supabase);
-                        broadcastGameState(gameCode);
-                        startTurnTimer(gameCode);
-                    }, 10000);
-                }
-                return;
-            }
-
-            if (!ws.userId) return;
-            const player = game.state.players.find(p => p.playerId === ws.userId);
-            if (!player || player.isRemoved) return;
-
-            if (game.state.players[gameState.currentPlayerIndex].playerId === ws.userId) {
-                startTurnTimer(gameCode);
-            }
-
-            switch (action) {
-                case 'START_GAME':
-                    await startGame(game.state, ws.userId, supabase);
-                    startTurnTimer(gameCode);
-                    break;
-                case 'ROLL_DICE':
-                    initiateRoll(game.state, ws.userId);
-                    broadcastGameState(gameCode); // Broadcast 1: Show rolling animation
-                    setTimeout(() => { // Outer setTimeout for rolling animation
-                        (async () => { // Use an async IIFE to handle promise rejections
-                            try {
-                                const shouldAdvance = await completeRoll(game.state, ws.userId, supabase);
-                                broadcastGameState(gameCode); // Broadcast 2: Show the dice result
-
-                                if (shouldAdvance) {
-                                    // If no moves are possible, wait for user to see the roll, then advance.
-                                    setTimeout(() => {
-                                        (async () => {
-                                            try {
-                                                await advanceTurn(game.state, supabase);
-                                                broadcastGameState(gameCode); // Broadcast 3: Next turn
-                                                startTurnTimer(gameCode);
-                                            } catch (e) {
-                                                console.error("Error during auto-advance turn:", e);
-                                            }
-                                        })();
-                                    }, 1000);
-                                }
-                            } catch (e) {
-                                console.error("Error during dice roll completion:", e);
-                            }
-                        })();
-                    }, 1000);
-                    return; // Prevent duplicate broadcast
-                case 'MOVE_PIECE': 
-                    await movePiece(game.state, ws.userId, payload.pieceId, supabase); 
-                    startTurnTimer(gameCode); 
-                    break;
-                case 'LEAVE_GAME': 
-                    await leaveGame(game.state, ws.userId, supabase); 
-                    startTurnTimer(gameCode); 
-                    break;
-                case 'SEND_CHAT_MESSAGE': 
-                    await sendChatMessage(game.state, ws.userId, payload.text, supabase); 
-                    break;
-                default: return;
-            }
-
-            broadcastGameState(gameCode);
-
-            if (game.state.gameStatus === 'Finished') {
-                handleGameFinish(gameCode);
-            }
-
-        } catch (err) {
-            console.error('Error processing message:', err);
-        }
-    });
-
-    ws.on('close', () => {
-        const gameCode = ws.gameCode;
-        if (!gameCode || !ws.userId) return;
-        
-        const game = games.get(gameCode);
-        if (game) {
-            // Just remove the client, don't alter game state
-            game.clients.delete(ws.userId);
-            console.log(`Player ${ws.userName} client disconnected from ${gameCode}. Game state remains.`);
-        }
-    });
-});
-
-function broadcastGameState(gameCode) {
-    const game = games.get(gameCode);
-    if (!game) return;
-    const statePayload = JSON.stringify({ type: 'GAME_STATE_UPDATE', payload: game.state });
-    for (const client of game.clients.values()) {
-        if (client.readyState === client.OPEN) client.send(statePayload);
-    }
-}
-
-function startTurnTimer(gameCode) {
-    const game = games.get(gameCode);
-    if (!game || game.state.gameStatus !== 'Playing') return;
-
-    clearTimeout(game.turnTimer);
-    game.state.turnTimeLeft = 30;
-
-    const timerTick = () => { // Not async
-        (async () => { // Wrapped in async IIFE with try/catch
-            try {
-                const currentGame = games.get(gameCode); // Re-fetch game to be safe
-                if (!currentGame || currentGame.state.gameStatus !== 'Playing') return;
-                
-                currentGame.state.turnTimeLeft--;
-                if (currentGame.state.turnTimeLeft <= 0) {
-                    await handleMissedTurn(currentGame.state, supabase);
-                    broadcastGameState(gameCode);
-                    if (currentGame.state.gameStatus === 'Finished') {
-                        handleGameFinish(gameCode);
-                    } else {
-                        startTurnTimer(gameCode);
-                    }
-                } else {
-                    currentGame.turnTimer = setTimeout(timerTick, 1000);
-                    if (currentGame.state.turnTimeLeft % 5 === 0) broadcastGameState(gameCode);
-                }
-            } catch (e) {
-                console.error('Error in turn timer tick:', e);
-            }
-        })();
-    };
-    game.turnTimer = setTimeout(timerTick, 1000);
-}
-
-async function handleGameFinish(gameCode) {
-    const game = games.get(gameCode);
-    if (!game) return;
-
-    console.log(`Game ${gameCode} finished.`);
-    clearTimeout(game.turnTimer);
-    game.turnTimer = null;
-    
-    setTimeout(() => {
-        games.delete(gameCode);
-        console.log(`Game ${gameCode} removed from memory.`);
-    }, 5000);
-}
-
-/************************************************************
- * Render Free Plan Keep-Alive (Self Ping)
- ************************************************************/
-
-// 1. Add a /ping endpoint to keep server awake
-app.get('/ping', (req, res) => res.send('pong'));
-
-// 2. Self-Ping every 12 minutes to prevent Render sleeping
-const SELF_URL = process.env.SELF_URL; 
-const ENABLE_KEEP_ALIVE = process.env.ENABLE_KEEP_ALIVE === "true";
-
-if (ENABLE_KEEP_ALIVE && SELF_URL) {
-    console.log("🔄 Keep-Alive Enabled. Server will ping itself every 12 minutes:", SELF_URL);
-    
-    setInterval(async () => {
-        try {
-            await fetch(`${SELF_URL}/ping`);
-            console.log("🔁 Self-Ping OK");
-        } catch (err) {
-            console.error("⚠️ Self-Ping Failed:", err.message);
-        }
-    }, 12 * 60 * 1000); // 12 minutes
-}
-// End render Keep-Alive (Self Ping)
-
-
-
-
-server.listen(PORT, () => console.log(`Dream Ludo server listening on port ${PORT}`));
+};
