@@ -9,7 +9,7 @@ const {
     createNewGame, addPlayer, startGame,
     initiateRoll, completeRoll, movePiece,
     leaveGame, sendChatMessage, handleMissedTurn,
-    handlePlayerDisconnect, handlePlayerReconnect, advanceTurn
+    advanceTurn
 } = require('./game');
 
 // --- Server & Supabase Setup ---
@@ -26,7 +26,6 @@ if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !SUPABASE_SERVICE_KEY) {
 // **MODIFIED**: Initialize with the service key to bypass RLS for server operations.
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const games = new Map(); // In-memory storage for active games
-const RECONNECT_GRACE_PERIOD = 30000; // 30 seconds
 
 const app = express();
 const server = createServer(app);
@@ -51,6 +50,12 @@ wss.on('connection', async (ws, req) => {
                 return;
             }
 
+            if (tournament.status === 'COMPLETED') {
+                ws.send(JSON.stringify({ type: 'ERROR', payload: { message: 'This game has already been played.' } }));
+                ws.close(1011, 'Game already completed.');
+                return;
+            }
+
             if (tournament.status !== 'ACTIVE') {
                 ws.close(1011, `Tournament is not active. Status: ${tournament.status}`);
                 return;
@@ -64,7 +69,7 @@ wss.on('connection', async (ws, req) => {
             };
 
             const gameState = createNewGame(gameCode, gameOptions);
-            games.set(gameCode, { state: gameState, clients: new Map(), turnTimer: null, reconnectTimers: new Map() });
+            games.set(gameCode, { state: gameState, clients: new Map(), turnTimer: null });
             console.log(`Game room created on-the-fly for tournament ${tournament.title} (${gameCode})`);
 
         } catch (e) {
@@ -95,11 +100,7 @@ wss.on('connection', async (ws, req) => {
                 game.clients.set(ws.userId, ws);
 
                 const existingPlayer = game.state.players.find(p => p.playerId === ws.userId);
-                if (existingPlayer && existingPlayer.disconnected) {
-                    clearTimeout(game.reconnectTimers.get(ws.userId));
-                    game.reconnectTimers.delete(ws.userId);
-                    handlePlayerReconnect(game.state, ws.userId);
-                } else if (!existingPlayer) {
+                 if (!existingPlayer) {
                     addPlayer(game.state, ws.userId, ws.userName);
                 }
 
@@ -176,21 +177,9 @@ wss.on('connection', async (ws, req) => {
         
         const game = games.get(gameCode);
         if (game) {
+            // Just remove the client, don't alter game state
             game.clients.delete(ws.userId);
-            handlePlayerDisconnect(game.state, ws.userId);
-            broadcastGameState(gameCode);
-
-            const reconnectTimer = setTimeout(async () => {
-                const game = games.get(gameCode);
-                if (game) {
-                    await leaveGame(game.state, ws.userId, supabase);
-                    broadcastGameState(gameCode);
-                    if (game.state.gameStatus === 'Finished') {
-                        handleGameFinish(gameCode);
-                    }
-                }
-            }, RECONNECT_GRACE_PERIOD);
-            game.reconnectTimers.set(ws.userId, reconnectTimer);
+            console.log(`Player ${ws.userName} client disconnected from ${gameCode}. Game state remains.`);
         }
     });
 });
