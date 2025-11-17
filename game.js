@@ -28,6 +28,7 @@ const PRE_HOME_POSITIONS = {
 
 const SAFE_SPOTS = [1, 9, 14, 22, 27, 35, 40, 48];
 const ALL_COLORS = [PlayerColor.Red, PlayerColor.Green, PlayerColor.Blue, PlayerColor.Yellow];
+const TWO_PLAYER_COLORS = [PlayerColor.Green, PlayerColor.Blue];
 
 // --- Helper Functions ---
 
@@ -204,7 +205,12 @@ function addPlayer(gameState, playerId, playerName) {
     if (gameState.players.some(p => p.playerId === playerId)) return;
 
     const isHost = gameState.players.length === 0;
-    const color = ALL_COLORS[gameState.players.length];
+    let color;
+    if (gameState.max_players === 2) {
+        color = TWO_PLAYER_COLORS[gameState.players.length];
+    } else {
+        color = ALL_COLORS[gameState.players.length];
+    }
     const player = createPlayer(playerId, playerName, color, isHost);
     
     gameState.players.push(player);
