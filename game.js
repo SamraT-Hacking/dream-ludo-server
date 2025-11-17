@@ -10,7 +10,7 @@ const TOTAL_PATH_LENGTH = 52;
 const HOME_STRETCH_LENGTH = 6;
 const FINISH_POSITION_START = 100;
 const TURN_TIME_LIMIT = 30;
-const MAX_INACTIVE_TURNS = 7; // UPDATED: Changed from 3 to 7
+const MAX_INACTIVE_TURNS = 5; // UPDATED: Changed from 3 to 5
 
 const START_POSITIONS = {
   [PlayerColor.Green]: 1,
