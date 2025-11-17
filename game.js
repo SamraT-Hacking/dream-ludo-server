@@ -10,7 +10,7 @@ const TOTAL_PATH_LENGTH = 52;
 const HOME_STRETCH_LENGTH = 6;
 const FINISH_POSITION_START = 100;
 const TURN_TIME_LIMIT = 30;
-const MAX_INACTIVE_TURNS = 3;
+const MAX_INACTIVE_TURNS = 7; // UPDATED: Changed from 3 to 7
 
 const START_POSITIONS = {
   [PlayerColor.Green]: 1,
@@ -50,7 +50,6 @@ function createPlayer(playerId, name, color, isHost = false) {
     hasFinished: false,
     isRemoved: false,
     inactiveTurns: 0,
-    disconnected: false,
   };
 }
 
@@ -142,19 +141,21 @@ async function advanceTurn(gameState, supabase) {
     let checkedAll = 0;
     
     while (
-        (gameState.players[nextIndex].hasFinished || gameState.players[nextIndex].isRemoved || gameState.players[nextIndex].disconnected) && 
+        (gameState.players[nextIndex].hasFinished || gameState.players[nextIndex].isRemoved) && 
         checkedAll < gameState.players.length
     ) {
         nextIndex = (nextIndex + 1) % gameState.players.length;
         checkedAll++;
     }
 
+    // REMOVED: Auto-win logic when only one player is left.
+    // The game should only end when someone wins properly.
     const activePlayers = gameState.players.filter(p => !p.isRemoved && !p.hasFinished);
-    if (activePlayers.length <= 1 && gameState.players.length > 1) {
+    if (activePlayers.length === 0 && gameState.players.length > 1) {
         gameState.gameStatus = GameStatus.Finished;
-        gameState.winner = activePlayers[0] || null;
-        gameState.message = "Game Over!";
-        await logTurnActivity(gameState, { description: `Game finished. Winner: ${gameState.winner?.name || 'None'}` }, supabase);
+        gameState.winner = null; // No winner if all players leave
+        gameState.message = "Game Over! No active players left.";
+        await logTurnActivity(gameState, { description: `Game finished. No winner.` }, supabase);
         return;
     }
 
@@ -297,16 +298,11 @@ async function movePiece(gameState, playerId, pieceId, supabase) {
 
     if (currentPlayer.pieces.every(p => p.state === PieceState.Finished)) {
         currentPlayer.hasFinished = true;
-        const activePlayers = gameState.players.filter(p => !p.isRemoved && !p.hasFinished);
-        if (activePlayers.length <= 1) {
-            gameState.winner = currentPlayer;
-            gameState.gameStatus = GameStatus.Finished;
-            gameState.message = `${currentPlayer.name} wins the game!`;
-            await logTurnActivity(gameState, { description: `Game finished. Winner: ${currentPlayer.name}` }, supabase);
-        } else {
-             gameState.message = `${currentPlayer.name} has finished!`;
-             await advanceTurn(gameState, supabase);
-        }
+        // This is the only valid win condition now
+        gameState.winner = currentPlayer;
+        gameState.gameStatus = GameStatus.Finished;
+        gameState.message = `${currentPlayer.name} wins the game!`;
+        await logTurnActivity(gameState, { description: `Game finished. Winner: ${currentPlayer.name}` }, supabase);
         return;
     }
 
@@ -335,37 +331,16 @@ async function handleMissedTurn(gameState, supabase) {
     }
 }
 
-function handlePlayerDisconnect(gameState, playerId) {
-    const player = gameState.players.find(p => p.playerId === playerId);
-    if (player) {
-        player.disconnected = true;
-        gameState.message = `${player.name} disconnected.`;
-    }
-}
-
-function handlePlayerReconnect(gameState, playerId) {
-    const player = gameState.players.find(p => p.playerId === playerId);
-    if (player) {
-        player.disconnected = false;
-        gameState.message = `${player.name} reconnected!`;
-    }
-}
-
 async function leaveGame(gameState, playerId, supabase) {
     const player = gameState.players.find(p => p.playerId === playerId);
     if (player && !player.isRemoved) {
         player.isRemoved = true;
-        player.disconnected = true;
         gameState.message = `${player.name} left the game.`;
         await logTurnActivity(gameState, { userId: player.playerId, name: player.name, description: `left the game.` }, supabase);
         
-        const activePlayers = gameState.players.filter(p => !p.isRemoved && !p.hasFinished);
-        if (activePlayers.length === 1 && gameState.players.length > 1) {
-             gameState.winner = activePlayers[0];
-             gameState.gameStatus = GameStatus.Finished;
-             gameState.message = `${activePlayers[0].name} wins as the opponent left!`;
-             await logTurnActivity(gameState, { description: `Game finished. Winner: ${activePlayers[0].name}` }, supabase);
-        } else if (gameState.players[gameState.currentPlayerIndex].playerId === playerId) {
+        // REMOVED: Auto-win logic when a player leaves.
+        
+        if (gameState.players[gameState.currentPlayerIndex].playerId === playerId) {
             await advanceTurn(gameState, supabase);
         }
     }
@@ -411,5 +386,5 @@ module.exports = {
     createNewGame, addPlayer, startGame,
     initiateRoll, completeRoll, movePiece,
     leaveGame, sendChatMessage, handleMissedTurn,
-    handlePlayerDisconnect, handlePlayerReconnect, advanceTurn
+    advanceTurn
 };
