@@ -338,7 +338,16 @@ async function leaveGame(gameState, playerId, supabase) {
         gameState.message = `${player.name} left the game.`;
         await logTurnActivity(gameState, { userId: player.playerId, name: player.name, description: `left the game.` }, supabase);
         
-        // REMOVED: Auto-win logic when a player leaves.
+        // Check if there is only one active player left to declare a winner.
+        const activePlayers = gameState.players.filter(p => !p.isRemoved && !p.hasFinished);
+        if (activePlayers.length === 1) {
+            const winner = activePlayers[0];
+            gameState.winner = winner;
+            gameState.gameStatus = GameStatus.Finished;
+            gameState.message = `${winner.name} wins as the opponent left the game!`;
+            await logTurnActivity(gameState, { userId: winner.playerId, name: winner.name, description: `won because opponent left.` }, supabase);
+            return; // Game is over, no need to advance turn.
+        }
         
         if (gameState.players[gameState.currentPlayerIndex].playerId === playerId) {
             await advanceTurn(gameState, supabase);
