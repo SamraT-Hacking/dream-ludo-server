@@ -1,3 +1,4 @@
+
 // /dream-ludo-server/game.js
 const { v4: uuidv4 } = require('uuid');
 
@@ -14,16 +15,16 @@ const MAX_INACTIVE_TURNS = 5; // UPDATED: Changed from 3 to 5
 
 const START_POSITIONS = {
   [PlayerColor.Green]: 1,
-  [PlayerColor.Red]: 14,
-  [PlayerColor.Yellow]: 40,
+  [PlayerColor.Yellow]: 14,
   [PlayerColor.Blue]: 27,
+  [PlayerColor.Red]: 40,
 };
 
 const PRE_HOME_POSITIONS = {
-  [PlayerColor.Green]: 51,
-  [PlayerColor.Red]: 12,
-  [PlayerColor.Yellow]: 38,
-  [PlayerColor.Blue]: 25,
+    [PlayerColor.Green]: 51,
+    [PlayerColor.Yellow]: 12,
+    [PlayerColor.Blue]: 25,
+    [PlayerColor.Red]: 38,
 };
 
 const SAFE_SPOTS = [1, 9, 14, 22, 27, 35, 40, 48];
