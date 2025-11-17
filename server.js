@@ -135,14 +135,17 @@ wss.on('connection', async (ws, req) => {
                     broadcastGameState(gameCode);
                     setTimeout(async () => {
                         const shouldAdvance = await completeRoll(game.state, ws.userId, supabase);
+                        
+                        // Always broadcast the result of the roll so the user can see it.
+                        broadcastGameState(gameCode);
+
                         if (shouldAdvance) {
+                            // If there are no movable pieces, wait a moment then advance the turn.
                             setTimeout(async () => {
                                 await advanceTurn(game.state, supabase);
                                 broadcastGameState(gameCode);
                                 startTurnTimer(gameCode);
-                            }, 1000);
-                        } else {
-                           broadcastGameState(gameCode);
+                            }, 1000); // Wait so player can see the roll
                         }
                     }, 1000);
                     return; // Return to prevent duplicate broadcast
@@ -239,5 +242,33 @@ async function handleGameFinish(gameCode) {
         console.log(`Game ${gameCode} removed from memory.`);
     }, 5000);
 }
+
+/************************************************************
+ * Render Free Plan Keep-Alive (Self Ping)
+ ************************************************************/
+
+// 1. Add a /ping endpoint to keep server awake
+app.get('/ping', (req, res) => res.send('pong'));
+
+// 2. Self-Ping every 12 minutes to prevent Render sleeping
+const SELF_URL = process.env.SELF_URL; 
+const ENABLE_KEEP_ALIVE = process.env.ENABLE_KEEP_ALIVE === "true";
+
+if (ENABLE_KEEP_ALIVE && SELF_URL) {
+    console.log("🔄 Keep-Alive Enabled. Server will ping itself every 12 minutes:", SELF_URL);
+    
+    setInterval(async () => {
+        try {
+            await fetch(`${SELF_URL}/ping`);
+            console.log("🔁 Self-Ping OK");
+        } catch (err) {
+            console.error("⚠️ Self-Ping Failed:", err.message);
+        }
+    }, 12 * 60 * 1000); // 12 minutes
+}
+// End render Keep-Alive (Self Ping)
+
+
+
 
 server.listen(PORT, () => console.log(`Dream Ludo server listening on port ${PORT}`));
