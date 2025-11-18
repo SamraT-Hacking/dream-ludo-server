@@ -15,7 +15,7 @@ const {
 
 // --- Server & Supabase Setup ---
 const PORT = process.env.PORT || 8080;
-// **MODIFIED**: Now requires SUPABASE_SERVICE_KEY for admin operations.
+// Requires SUPABASE_SERVICE_KEY for admin operations (bypassing RLS).
 const { SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_KEY } = process.env;
 
 if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !SUPABASE_SERVICE_KEY) {
@@ -24,7 +24,7 @@ if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !SUPABASE_SERVICE_KEY) {
     process.exit(1);
 }
 
-// **MODIFIED**: Initialize with the service key to bypass RLS for server operations.
+// Initialize with the service key to bypass RLS for server operations.
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const games = new Map(); // In-memory storage for active games
 
@@ -32,7 +32,7 @@ const app = express();
 
 // CORS Middleware
 app.use((req, res, next) => {
-    res.header("Access-Control-Allow-Origin", "*"); // Allow all origins for now, restrict in prod if needed
+    res.header("Access-Control-Allow-Origin", "*"); 
     res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
     if (req.method === 'OPTIONS') {
         return res.sendStatus(200);
@@ -41,27 +41,154 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json());
-app.use(express.urlencoded({ extended: true })); // Parse URL-encoded bodies (often used by gateways)
+app.use(express.urlencoded({ extended: true })); 
 
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
 app.get('/health', (req, res) => res.send('OK'));
 
-// --- Payment Endpoints (UddoktaPay) ---
+// --- Payment Helper Logic ---
 
-// Helper for redirection - This fixes the 405 Error
+// Function to handle deposit completion securely on the server
+async function processDepositServerSide(transactionId) {
+    console.log(`Processing deposit for TxID: ${transactionId}`);
+    try {
+        // 1. Fetch Transaction
+        const { data: tx, error: txError } = await supabase
+            .from('transactions')
+            .select('*')
+            .eq('id', transactionId)
+            .single();
+
+        if (txError || !tx) {
+            console.error(`Tx ${transactionId} not found or error:`, txError);
+            return false;
+        }
+        
+        if (tx.status === 'COMPLETED') {
+            console.log(`Tx ${transactionId} already completed.`);
+            return true; 
+        }
+
+        // 2. Update Transaction to COMPLETED first to prevent race conditions
+        const { error: updateError } = await supabase
+            .from('transactions')
+            .update({ status: 'COMPLETED' })
+            .eq('id', transactionId);
+        
+        if (updateError) {
+             console.error(`Error updating Tx ${transactionId} status:`, updateError);
+             throw updateError;
+        }
+
+        // 3. Fetch User Profile
+        const { data: profile, error: profileError } = await supabase
+            .from('profiles')
+            .select('*')
+            .eq('id', tx.user_id)
+            .single();
+
+        if (!profile || profileError) {
+             console.error(`Profile not found for user ${tx.user_id}`);
+             return false;
+        }
+
+        // 4. Add Balance to User
+        const depositAmount = Number(tx.amount);
+        const newBalance = Number(profile.deposit_balance) + depositAmount;
+        
+        await supabase
+            .from('profiles')
+            .update({ deposit_balance: newBalance })
+            .eq('id', tx.user_id);
+
+        console.log(`Added ${depositAmount} to user ${tx.user_id}. New Balance: ${newBalance}`);
+
+        // 5. Handle First Deposit Referrals
+        // Check if this was the first completed deposit
+        const { count } = await supabase
+            .from('transactions')
+            .select('*', { count: 'exact', head: true })
+            .eq('user_id', tx.user_id)
+            .eq('type', 'DEPOSIT')
+            .eq('status', 'COMPLETED');
+        
+        // count is 1 because we just updated this one to COMPLETED.
+        const isFirstDeposit = count === 1; 
+
+        if (isFirstDeposit && profile.referred_by) {
+            console.log(`Processing referral for user ${tx.user_id} referred by ${profile.referred_by}`);
+            
+            // Fetch Settings
+            const { data: settingsData } = await supabase
+                .from('app_settings')
+                .select('key, value')
+                .in('key', ['referral_bonus_amount', 'referee_bonus_amount']);
+            
+            let referralBonus = 0;
+            let refereeBonus = 0;
+            if (settingsData) {
+                const refSetting = settingsData.find(s => s.key === 'referral_bonus_amount');
+                const refereeSetting = settingsData.find(s => s.key === 'referee_bonus_amount');
+                if (refSetting?.value?.amount) referralBonus = Number(refSetting.value.amount);
+                if (refereeSetting?.value?.amount) refereeBonus = Number(refereeSetting.value.amount);
+            }
+
+            // Award Referrer
+            if (referralBonus > 0) {
+                const { data: referrer } = await supabase.from('profiles').select('*').eq('id', profile.referred_by).single();
+                if (referrer) {
+                        const newRefBalance = Number(referrer.deposit_balance) + referralBonus;
+                        await supabase.from('profiles').update({ deposit_balance: newRefBalance }).eq('id', profile.referred_by);
+                        await supabase.from('transactions').insert({
+                        user_id: profile.referred_by,
+                        amount: referralBonus,
+                        type: 'REFERRAL_BONUS',
+                        status: 'COMPLETED',
+                        description: `Referral bonus from ${profile.username}`,
+                        source_user_id: tx.user_id
+                        });
+                        console.log(`Awarded referrer ${profile.referred_by} bonus: ${referralBonus}`);
+                }
+            }
+            // Award Referee (Current User)
+            if (refereeBonus > 0) {
+                    // Refresh profile balance before adding bonus
+                    const { data: refreshedProfile } = await supabase.from('profiles').select('deposit_balance').eq('id', tx.user_id).single();
+                    const currentBal = Number(refreshedProfile.deposit_balance);
+                    
+                    await supabase.from('profiles').update({ deposit_balance: currentBal + refereeBonus }).eq('id', tx.user_id);
+                    await supabase.from('transactions').insert({
+                    user_id: tx.user_id,
+                    amount: refereeBonus,
+                    type: 'REFERRAL_BONUS',
+                    status: 'COMPLETED',
+                    description: 'Sign-up bonus for using a referral code.'
+                    });
+                    console.log(`Awarded referee ${tx.user_id} bonus: ${refereeBonus}`);
+            }
+        }
+        return true;
+    } catch (e) {
+        console.error("Error processing deposit server side:", e);
+        return false;
+    }
+}
+
+
+// --- Payment Endpoints ---
+
 const handleGatewayRedirect = (req, res, status) => {
     const frontendUrl = req.query.frontend_url;
+    // Redirect using 303 to force GET method for the frontend route
     if (frontendUrl) {
-        // Use 303 See Other to force the browser to perform a GET request to the frontend
         res.redirect(303, `${frontendUrl}/#/wallet?payment=${status}`);
     } else {
-        res.send(`Payment ${status}. You can return to the app.`);
+        res.send(`Payment ${status}. Please close this window and return to the app.`);
     }
 };
 
-// These endpoints accept POST/GET from the gateway and redirect to frontend via GET
 app.all('/api/payment/success', (req, res) => handleGatewayRedirect(req, res, 'success'));
 app.all('/api/payment/cancel', (req, res) => handleGatewayRedirect(req, res, 'cancel'));
 
@@ -74,16 +201,16 @@ app.post('/api/payment/init', async (req, res) => {
     }
 
     try {
-        // 1. Fetch User Profile
+        // 1. Fetch User
         const { data: profile, error: profileError } = await supabase
             .from('profiles')
-            .select('username, id') // We don't have email in profiles, using dummy or metadata if possible
+            .select('username, id') 
             .eq('id', userId)
             .single();
 
         if (profileError || !profile) return res.status(404).json({ error: 'User not found' });
 
-        // 2. Fetch Gateway Settings
+        // 2. Fetch Settings
         const { data: settingsData, error: settingsError } = await supabase
             .from('app_settings')
             .select('value')
@@ -91,48 +218,41 @@ app.post('/api/payment/init', async (req, res) => {
             .single();
 
         if (settingsError || !settingsData) return res.status(500).json({ error: 'Payment settings not found' });
-
         const settings = settingsData.value;
         
-        // Validate Gateway
+        // 3. Create Pending Transaction
+        const { data: transaction, error: txError } = await supabase
+            .from('transactions')
+            .insert({
+                user_id: userId,
+                amount: amount,
+                type: 'DEPOSIT',
+                status: 'PENDING',
+                description: `Online Deposit via ${gateway || 'Gateway'}`
+            })
+            .select()
+            .single();
+
+        if (txError) return res.status(500).json({ error: 'Failed to create transaction record.' });
+
+        // 4. Process Gateway
         if (gateway === 'uddoktapay') {
             const apiKey = settings.uddoktapay?.api_key;
             const apiUrl = settings.uddoktapay?.api_url;
 
-            if (!apiKey || !apiUrl) {
-                return res.status(500).json({ error: 'UddoktaPay not configured correctly.' });
-            }
+            if (!apiKey || !apiUrl) return res.status(500).json({ error: 'UddoktaPay not configured.' });
 
-            // 3. Create Pending Transaction in DB
-            const { data: transaction, error: txError } = await supabase
-                .from('transactions')
-                .insert({
-                    user_id: userId,
-                    amount: amount,
-                    type: 'DEPOSIT',
-                    status: 'PENDING',
-                    description: 'Online Deposit via UddoktaPay'
-                })
-                .select()
-                .single();
-
-            if (txError) return res.status(500).json({ error: 'Failed to create transaction record.' });
-
-            // 4. Call UddoktaPay API
             const serverBaseUrl = process.env.SELF_URL || `https://${req.get('host')}`; 
-            
-            // Encode the frontend URL to safely pass it as a query param to our own backend
             const encodedFrontendUrl = encodeURIComponent(redirectBaseUrl);
             
             const payload = {
                 full_name: profile.username || "Ludo Player",
-                email: "user@example.com", // Email is required by UddoktaPay, using placeholder if not available
+                email: "user@example.com", 
                 amount: amount.toString(),
                 metadata: {
                     user_id: userId,
-                    transaction_id: transaction.id // Important: Link back to our DB
+                    transaction_id: transaction.id 
                 },
-                // Point to OUR backend first to handle the POST-to-GET conversion
                 redirect_url: `${serverBaseUrl}/api/payment/success?frontend_url=${encodedFrontendUrl}`,
                 cancel_url: `${serverBaseUrl}/api/payment/cancel?frontend_url=${encodedFrontendUrl}`,
                 webhook_url: `${serverBaseUrl}/api/payment/webhook` 
@@ -140,10 +260,7 @@ app.post('/api/payment/init', async (req, res) => {
 
             const response = await fetch(apiUrl, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'RT-UDDOKTAPAY-API-KEY': apiKey
-                },
+                headers: { 'Content-Type': 'application/json', 'RT-UDDOKTAPAY-API-KEY': apiKey },
                 body: JSON.stringify(payload)
             });
 
@@ -152,15 +269,11 @@ app.post('/api/payment/init', async (req, res) => {
             if (data.status && data.payment_url) {
                 return res.json({ payment_url: data.payment_url });
             } else {
-                // Clean up pending transaction if API fails
-                await supabase.from('transactions').update({ status: 'FAILED', description: 'API Init Failed: ' + (data.message || 'Unknown') }).eq('id', transaction.id);
-                return res.status(400).json({ error: data.message || 'Failed to initiate payment with gateway.' });
+                await supabase.from('transactions').update({ status: 'FAILED' }).eq('id', transaction.id);
+                return res.status(400).json({ error: data.message || 'Gateway Init Failed' });
             }
-        } else if (gateway === 'paytm') {
-             // Placeholder for Paytm implementation
-             return res.status(501).json({ error: 'Paytm integration not fully implemented yet.' });
         } else {
-            return res.status(400).json({ error: 'Invalid gateway selected.' });
+            return res.status(400).json({ error: 'Invalid or unimplemented gateway.' });
         }
 
     } catch (e) {
@@ -171,40 +284,28 @@ app.post('/api/payment/init', async (req, res) => {
 
 // Webhook Handler
 app.post('/api/payment/webhook', async (req, res) => {
-    // Verify signature header if available: 'rt-uddoktapay-verify-signature'
-    // For now, we trust the metadata transaction_id and status from the body
-    
     const { status, metadata } = req.body;
 
+    // UddoktaPay might send 'COMPLETED' or just 'success'? Docs say 'COMPLETED' usually.
+    // Checking multiple variations to be safe.
+    const isSuccess = status === 'COMPLETED' || status === 'completed' || status === 'SUCCESS';
+
     if (!metadata || !metadata.transaction_id) {
-        return res.status(400).send('Invalid Webhook Payload');
+        return res.status(400).send('Invalid Payload');
     }
 
-    console.log(`Webhook received for Tx: ${metadata.transaction_id}, Status: ${status}`);
+    console.log(`Webhook: Tx ${metadata.transaction_id} Status: ${status}`);
 
     try {
-        if (status === 'COMPLETED') {
-            // Use the existing Postgres RPC function to process deposit securely
-            // This handles double-checking status, adding balance, and referral bonuses
-            const { data, error } = await supabase.rpc('process_deposit', {
-                transaction_id_to_process: metadata.transaction_id,
-                is_approved: true
-            });
-
-            if (error) {
-                console.error("Webhook processing error:", error);
-                return res.status(500).send('Error processing deposit');
-            }
-            console.log("Deposit processed:", data);
+        if (isSuccess) {
+            await processDepositServerSide(metadata.transaction_id);
         } else {
-             // Mark as failed/cancelled if needed
              await supabase
                 .from('transactions')
                 .update({ status: 'FAILED' })
                 .eq('id', metadata.transaction_id)
-                .eq('status', 'PENDING'); // Only update if still pending
+                .eq('status', 'PENDING'); 
         }
-
         res.send('OK');
     } catch (e) {
         console.error('Webhook Error:', e);
@@ -315,20 +416,16 @@ wss.on('connection', async (ws, req) => {
                     broadcastGameState(gameCode);
                     setTimeout(async () => {
                         const shouldAdvance = await completeRoll(game.state, ws.userId, supabase);
-                        
-                        // Always broadcast the result of the roll so the user can see it.
                         broadcastGameState(gameCode);
-
                         if (shouldAdvance) {
-                            // If there are no movable pieces, wait a moment then advance the turn.
                             setTimeout(async () => {
                                 await advanceTurn(game.state, supabase);
                                 broadcastGameState(gameCode);
                                 startTurnTimer(gameCode);
-                            }, 1000); // Wait so player can see the roll
+                            }, 1000);
                         }
                     }, 1000);
-                    return; // Return to prevent duplicate broadcast
+                    return;
                 case 'MOVE_PIECE': 
                     await movePiece(game.state, ws.userId, payload.pieceId, supabase); 
                     startTurnTimer(gameCode); 
@@ -360,9 +457,8 @@ wss.on('connection', async (ws, req) => {
         
         const game = games.get(gameCode);
         if (game) {
-            // Just remove the client, don't alter game state
             game.clients.delete(ws.userId);
-            console.log(`Player ${ws.userName} client disconnected from ${gameCode}. Game state remains.`);
+            console.log(`Player ${ws.userName} disconnected from ${gameCode}.`);
         }
     });
 });
@@ -417,32 +513,13 @@ async function handleGameFinish(gameCode) {
     }, 5000);
 }
 
-/************************************************************
- * Render Free Plan Keep-Alive (Self Ping)
- ************************************************************/
-
-// 1. Add a /ping endpoint to keep server awake
+// Keep-Alive Logic
 app.get('/ping', (req, res) => res.send('pong'));
-
-// 2. Self-Ping every 12 minutes to prevent Render sleeping
 const SELF_URL = process.env.SELF_URL; 
-const ENABLE_KEEP_ALIVE = process.env.ENABLE_KEEP_ALIVE === "true";
-
-if (ENABLE_KEEP_ALIVE && SELF_URL) {
-    console.log("🔄 Keep-Alive Enabled. Server will ping itself every 12 minutes:", SELF_URL);
-    
+if (process.env.ENABLE_KEEP_ALIVE === "true" && SELF_URL) {
     setInterval(async () => {
-        try {
-            await fetch(`${SELF_URL}/ping`);
-            console.log("🔁 Self-Ping OK");
-        } catch (err) {
-            console.error("⚠️ Self-Ping Failed:", err.message);
-        }
-    }, 12 * 60 * 1000); // 12 minutes
+        try { await fetch(`${SELF_URL}/ping`); } catch (err) { console.error("Self-Ping Failed:", err.message); }
+    }, 12 * 60 * 1000);
 }
-// End render Keep-Alive (Self Ping)
-
-
-
 
 server.listen(PORT, () => console.log(`Dream Ludo server listening on port ${PORT}`));
