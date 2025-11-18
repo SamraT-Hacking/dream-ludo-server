@@ -180,10 +180,10 @@ async function processDepositServerSide(transactionId) {
 // --- Payment Endpoints ---
 
 const handleGatewayRedirect = (req, res, status) => {
-    const frontendUrl = req.query.frontend_url;
-    const transactionId = req.query.transaction_id;
-    // UddoktaPay usually returns 'invoice_id' in the query params upon redirect
-    const invoiceId = req.query.invoice_id;
+    const frontendUrl = req.query.frontend_url || req.body.frontend_url;
+    const transactionId = req.query.transaction_id || req.body.transaction_id;
+    // UddoktaPay might return invoice_id in query OR body
+    const invoiceId = req.query.invoice_id || req.body.invoice_id;
 
     if (frontendUrl) {
         // Redirect using 303 to force GET method
@@ -296,8 +296,8 @@ app.post('/api/payment/init', async (req, res) => {
 app.post('/api/payment/verify', async (req, res) => {
     const { transactionId, invoiceId } = req.body;
 
-    if (!transactionId || !invoiceId) {
-        return res.status(400).json({ error: 'Missing transaction ID or invoice ID.' });
+    if (!transactionId || !invoiceId || invoiceId === 'undefined') {
+        return res.status(400).json({ error: 'Missing valid transaction ID or invoice ID.' });
     }
 
     try {
