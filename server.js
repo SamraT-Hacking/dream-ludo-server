@@ -181,9 +181,17 @@ async function processDepositServerSide(transactionId) {
 
 const handleGatewayRedirect = (req, res, status) => {
     const frontendUrl = req.query.frontend_url;
-    // Redirect using 303 to force GET method for the frontend route
+    const transactionId = req.query.transaction_id;
+    // UddoktaPay usually returns 'invoice_id' in the query params upon redirect
+    const invoiceId = req.query.invoice_id;
+
     if (frontendUrl) {
-        res.redirect(303, `${frontendUrl}/#/wallet?payment=${status}`);
+        // Redirect using 303 to force GET method
+        let redirectUrl = `${frontendUrl}/#/wallet?payment=${status}`;
+        if (transactionId) redirectUrl += `&transaction_id=${transactionId}`;
+        if (invoiceId) redirectUrl += `&invoice_id=${invoiceId}`;
+        
+        res.redirect(303, redirectUrl);
     } else {
         res.send(`Payment ${status}. Please close this window and return to the app.`);
     }
@@ -204,7 +212,7 @@ app.post('/api/payment/init', async (req, res) => {
         // 1. Fetch User
         const { data: profile, error: profileError } = await supabase
             .from('profiles')
-            .select('username, id') 
+            .select('username, id, email') 
             .eq('id', userId)
             .single();
 
@@ -244,17 +252,19 @@ app.post('/api/payment/init', async (req, res) => {
 
             const serverBaseUrl = process.env.SELF_URL || `https://${req.get('host')}`; 
             const encodedFrontendUrl = encodeURIComponent(redirectBaseUrl);
+            // Append transaction_id to the return URLs so we can identify it later
+            const returnUrlParams = `frontend_url=${encodedFrontendUrl}&transaction_id=${transaction.id}`;
             
             const payload = {
                 full_name: profile.username || "Ludo Player",
-                email: "user@example.com", 
+                email: profile.email || "user@dreamludo.com", 
                 amount: amount.toString(),
                 metadata: {
                     user_id: userId,
                     transaction_id: transaction.id 
                 },
-                redirect_url: `${serverBaseUrl}/api/payment/success?frontend_url=${encodedFrontendUrl}`,
-                cancel_url: `${serverBaseUrl}/api/payment/cancel?frontend_url=${encodedFrontendUrl}`,
+                redirect_url: `${serverBaseUrl}/api/payment/success?${returnUrlParams}`,
+                cancel_url: `${serverBaseUrl}/api/payment/cancel?${returnUrlParams}`,
                 webhook_url: `${serverBaseUrl}/api/payment/webhook` 
             };
 
@@ -282,12 +292,66 @@ app.post('/api/payment/init', async (req, res) => {
     }
 });
 
+// Manual Verify Endpoint
+app.post('/api/payment/verify', async (req, res) => {
+    const { transactionId, invoiceId } = req.body;
+
+    if (!transactionId || !invoiceId) {
+        return res.status(400).json({ error: 'Missing transaction ID or invoice ID.' });
+    }
+
+    try {
+        // 1. Get Settings for API Key
+        const { data: settingsData } = await supabase
+            .from('app_settings')
+            .select('value')
+            .eq('key', 'deposit_gateway_settings')
+            .single();
+        
+        if (!settingsData) return res.status(500).json({ error: 'Server config error.' });
+        
+        const apiKey = settingsData.value?.uddoktapay?.api_key;
+        const verifyUrl = "https://uddoktapay.com/api/verify-payment"; // Default endpoint
+
+        if (!apiKey) return res.status(500).json({ error: 'Gateway not configured.' });
+
+        // 2. Call Gateway Verify API
+        const verifyPayload = { invoice_id: invoiceId };
+        const response = await fetch(verifyUrl, {
+            method: 'POST',
+            headers: { 
+                'Content-Type': 'application/json',
+                'RT-UDDOKTAPAY-API-KEY': apiKey 
+            },
+            body: JSON.stringify(verifyPayload)
+        });
+
+        const data = await response.json();
+
+        // 3. Check status
+        // UddoktaPay returns { status: true, message: "...", data: { status: "COMPLETED", ... } }
+        if (data.status && (data.data?.status === 'COMPLETED' || data.data?.status === 'SUCCESS')) {
+             // Success! Process the deposit.
+             const success = await processDepositServerSide(transactionId);
+             if (success) {
+                 return res.json({ success: true, message: 'Payment verified and wallet updated.' });
+             } else {
+                 return res.status(500).json({ error: 'Payment verified but wallet update failed.' });
+             }
+        } else {
+            return res.status(400).json({ error: 'Payment not completed or verification failed at gateway.' });
+        }
+
+    } catch (e) {
+        console.error("Verify API Error:", e);
+        return res.status(500).json({ error: e.message });
+    }
+});
+
 // Webhook Handler
 app.post('/api/payment/webhook', async (req, res) => {
     const { status, metadata } = req.body;
 
-    // UddoktaPay might send 'COMPLETED' or just 'success'? Docs say 'COMPLETED' usually.
-    // Checking multiple variations to be safe.
     const isSuccess = status === 'COMPLETED' || status === 'completed' || status === 'SUCCESS';
 
     if (!metadata || !metadata.transaction_id) {
