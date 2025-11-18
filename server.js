@@ -41,12 +41,29 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // Parse URL-encoded bodies (often used by gateways)
+
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
 app.get('/health', (req, res) => res.send('OK'));
 
 // --- Payment Endpoints (UddoktaPay) ---
+
+// Helper for redirection - This fixes the 405 Error
+const handleGatewayRedirect = (req, res, status) => {
+    const frontendUrl = req.query.frontend_url;
+    if (frontendUrl) {
+        // Use 303 See Other to force the browser to perform a GET request to the frontend
+        res.redirect(303, `${frontendUrl}/#/wallet?payment=${status}`);
+    } else {
+        res.send(`Payment ${status}. You can return to the app.`);
+    }
+};
+
+// These endpoints accept POST/GET from the gateway and redirect to frontend via GET
+app.all('/api/payment/success', (req, res) => handleGatewayRedirect(req, res, 'success'));
+app.all('/api/payment/cancel', (req, res) => handleGatewayRedirect(req, res, 'cancel'));
 
 // Initialize Payment
 app.post('/api/payment/init', async (req, res) => {
@@ -102,7 +119,10 @@ app.post('/api/payment/init', async (req, res) => {
             if (txError) return res.status(500).json({ error: 'Failed to create transaction record.' });
 
             // 4. Call UddoktaPay API
-            const serverBaseUrl = process.env.SELF_URL || `https://${req.get('host')}`; // Best effort detection
+            const serverBaseUrl = process.env.SELF_URL || `https://${req.get('host')}`; 
+            
+            // Encode the frontend URL to safely pass it as a query param to our own backend
+            const encodedFrontendUrl = encodeURIComponent(redirectBaseUrl);
             
             const payload = {
                 full_name: profile.username || "Ludo Player",
@@ -112,9 +132,10 @@ app.post('/api/payment/init', async (req, res) => {
                     user_id: userId,
                     transaction_id: transaction.id // Important: Link back to our DB
                 },
-                redirect_url: `${redirectBaseUrl}/#/wallet?payment=success`,
-                cancel_url: `${redirectBaseUrl}/#/wallet?payment=cancel`,
-                webhook_url: `${serverBaseUrl}/api/payment/webhook` // Server must be public
+                // Point to OUR backend first to handle the POST-to-GET conversion
+                redirect_url: `${serverBaseUrl}/api/payment/success?frontend_url=${encodedFrontendUrl}`,
+                cancel_url: `${serverBaseUrl}/api/payment/cancel?frontend_url=${encodedFrontendUrl}`,
+                webhook_url: `${serverBaseUrl}/api/payment/webhook` 
             };
 
             const response = await fetch(apiUrl, {
@@ -380,12 +401,6 @@ function startTurnTimer(gameCode) {
         }
     };
     game.turnTimer = setTimeout(timerTick, 1000);
-}
-
-async function archiveGameData(gameCode) {
-    // This function is now OBSOLETE as data is saved in real-time.
-    // Kept here to avoid breaking the call in handleGameFinish, but it does nothing.
-    return;
 }
 
 async function handleGameFinish(gameCode) {
