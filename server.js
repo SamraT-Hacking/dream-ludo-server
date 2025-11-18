@@ -202,7 +202,7 @@ app.all('/api/payment/cancel', (req, res) => handleGatewayRedirect(req, res, 'ca
 
 // Initialize Payment
 app.post('/api/payment/init', async (req, res) => {
-    const { userId, amount, gateway, redirectBaseUrl } = req.body;
+    const { userId, amount, gateway, redirectBaseUrl, userEmail, userName } = req.body;
 
     if (!userId || !amount || !redirectBaseUrl) {
         return res.status(400).json({ error: 'Missing required fields' });
@@ -212,7 +212,7 @@ app.post('/api/payment/init', async (req, res) => {
         // 1. Fetch User
         const { data: profile, error: profileError } = await supabase
             .from('profiles')
-            .select('username, id, email') 
+            .select('username, id') 
             .eq('id', userId)
             .single();
 
@@ -256,8 +256,8 @@ app.post('/api/payment/init', async (req, res) => {
             const returnUrlParams = `frontend_url=${encodedFrontendUrl}&transaction_id=${transaction.id}`;
             
             const payload = {
-                full_name: profile.username || "Ludo Player",
-                email: profile.email || "user@dreamludo.com", 
+                full_name: userName || profile.username || "Ludo Player",
+                email: userEmail || "user@dreamludo.com", 
                 amount: amount.toString(),
                 metadata: {
                     user_id: userId,
