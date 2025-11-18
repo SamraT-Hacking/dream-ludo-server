@@ -202,13 +202,13 @@ app.all('/api/payment/cancel', (req, res) => handleGatewayRedirect(req, res, 'ca
 
 // Initialize Payment
 app.post('/api/payment/init', async (req, res) => {
-    const { userId, amount, gateway, redirectBaseUrl, userEmail, userName } = req.body;
-
-    if (!userId || !amount || !redirectBaseUrl) {
-        return res.status(400).json({ error: 'Missing required fields' });
-    }
-
     try {
+        const { userId, amount, gateway, redirectBaseUrl, userEmail, userName } = req.body;
+
+        if (!userId || !amount || !redirectBaseUrl) {
+            return res.status(400).json({ error: 'Missing required fields' });
+        }
+
         // 1. Fetch User
         const { data: profile, error: profileError } = await supabase
             .from('profiles')
@@ -288,19 +288,22 @@ app.post('/api/payment/init', async (req, res) => {
 
     } catch (e) {
         console.error('Payment Init Error:', e);
-        res.status(500).json({ error: 'Internal Server Error' });
+        // Check if response is already sent to prevent "headers already sent" error
+        if (!res.headersSent) {
+             res.status(500).json({ error: e.message || 'Internal Server Error' });
+        }
     }
 });
 
 // Manual Verify Endpoint
 app.post('/api/payment/verify', async (req, res) => {
-    const { transactionId, invoiceId } = req.body;
-
-    if (!transactionId || !invoiceId || invoiceId === 'undefined') {
-        return res.status(400).json({ error: 'Missing valid transaction ID or invoice ID.' });
-    }
-
     try {
+        const { transactionId, invoiceId } = req.body;
+
+        if (!transactionId || !invoiceId || invoiceId === 'undefined') {
+            return res.status(400).json({ error: 'Missing valid transaction ID or invoice ID.' });
+        }
+
         // 1. Get Settings for API Key
         const { data: settingsData } = await supabase
             .from('app_settings')
@@ -344,7 +347,9 @@ app.post('/api/payment/verify', async (req, res) => {
 
     } catch (e) {
         console.error("Verify API Error:", e);
-        return res.status(500).json({ error: e.message });
+        if (!res.headersSent) {
+            return res.status(500).json({ error: e.message || "Internal Server Error during verification." });
+        }
     }
 });
 
