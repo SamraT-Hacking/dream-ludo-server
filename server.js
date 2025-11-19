@@ -812,7 +812,7 @@ wss.on('connection', (ws, req) => {
                     return;
                 }
 
-                // NEW: Handle TYPING event
+                // Handle TYPING event
                 if (type === 'TYPING') {
                     const { target_user_id, isTyping } = payload;
                     const isSenderAdmin = ws.userRole === 'admin';
@@ -917,7 +917,27 @@ wss.on('connection', (ws, req) => {
                 
                 let game = games.get(gameCode);
                 if (!game) {
-                    const options = { hostId: ws.userId, hostName: ws.userName, type: 'manual' };
+                    // --- NEW LOGIC START ---
+                    let type = 'manual';
+                    let max_players = 2; // Default for manual
+                    let tournamentId = null;
+
+                    // Check if this code corresponds to a Tournament
+                    const { data: tournament } = await supabase
+                        .from('tournaments')
+                        .select('*')
+                        .eq('game_code', gameCode)
+                        .neq('status', 'CANCELLED') // Ensure not cancelled
+                        .maybeSingle(); // Use maybeSingle to avoid error if not found
+
+                    if (tournament) {
+                        type = 'tournament';
+                        max_players = tournament.max_players;
+                        tournamentId = tournament.id;
+                    }
+                    // --- NEW LOGIC END ---
+
+                    const options = { hostId: ws.userId, hostName: ws.userName, type, max_players, tournamentId };
                     const gameState = createNewGame(gameCode, options);
                     game = { state: gameState, clients: new Map(), turnTimer: null };
                     games.set(gameCode, game);
