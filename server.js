@@ -282,7 +282,23 @@ app.all('/api/payment/success', async (req, res) => {
     }
 });
 
-app.all('/api/payment/cancel', (req, res) => handleGatewayRedirect(req, res, 'cancel'));
+app.all('/api/payment/cancel', async (req, res) => {
+    const transactionId = req.query.transaction_id || req.body.transaction_id;
+
+    // Update status to FAILED when user cancels at gateway
+    if (transactionId && isValidUuid(transactionId)) {
+        try {
+            await supabase
+                .from('transactions')
+                .update({ status: 'FAILED', description: 'Payment Cancelled by User' })
+                .eq('id', transactionId);
+        } catch (e) {
+            console.error("Error marking transaction as cancelled:", e);
+        }
+    }
+    
+    handleGatewayRedirect(req, res, 'cancel');
+});
 
 app.post('/api/payment/init', async (req, res) => {
     try {
