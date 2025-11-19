@@ -201,6 +201,20 @@ const handleGatewayRedirect = (req, res, status) => {
     }
 };
 
+async function logGatewayResponse(invoiceId, transactionId, data) {
+    try {
+        const { error } = await supabase.from('deposit_gateway_logs').insert({
+            invoice_id: invoiceId,
+            transaction_id: transactionId,
+            gateway: 'uddoktapay',
+            raw_response: data
+        });
+        if (error) console.warn('Failed to insert gateway log:', error.message);
+    } catch (e) {
+        console.warn('Exception logging gateway response:', e.message);
+    }
+}
+
 app.all('/api/payment/success', async (req, res) => {
     const frontendUrl = req.query.frontend_url || req.body.frontend_url;
     const transactionId = req.query.transaction_id || req.body.transaction_id;
@@ -220,16 +234,12 @@ app.all('/api/payment/success', async (req, res) => {
             const apiUrl = settings?.api_url;
 
             if (apiKey && apiUrl) {
-                // Dynamically construct verify URL. Replace 'checkout-v2' with 'verify-payment'
-                // or if URL structure is different, append /verify-payment to the base.
-                // Standard V2 API: .../api/checkout-v2  -> .../api/verify-payment
                 let verifyUrl = apiUrl;
                 if (verifyUrl.endsWith('/checkout-v2')) {
                     verifyUrl = verifyUrl.replace('/checkout-v2', '/verify-payment');
                 } else if (verifyUrl.endsWith('/checkout-v2/')) {
                      verifyUrl = verifyUrl.replace('/checkout-v2/', '/verify-payment');
                 } else {
-                    // Fallback: try to use it as base if it doesn't have specific endpoint
                     verifyUrl = verifyUrl.replace(/\/$/, '') + '/verify-payment';
                 }
 
@@ -239,7 +249,6 @@ app.all('/api/payment/success', async (req, res) => {
                     body: JSON.stringify({ invoice_id: invoiceId })
                 });
                 
-                // Safe response handling
                 const responseText = await response.text();
                 let data;
                 try {
@@ -247,11 +256,23 @@ app.all('/api/payment/success', async (req, res) => {
                 } catch (parseError) {
                     console.error("Failed to parse Gateway response as JSON:", responseText);
                 }
+                
+                if (data) {
+                    await logGatewayResponse(invoiceId, transactionId, data);
+                    
+                    // Flexible status check: supports root-level 'status' or nested 'data.status'
+                    let paymentStatus = null;
+                    if (typeof data.status === 'string') {
+                        paymentStatus = data.status;
+                    } else if (data.data && data.data.status) {
+                         paymentStatus = data.data.status;
+                    }
 
-                if (data && data.status && (data.data?.status === 'COMPLETED' || data.data?.status === 'SUCCESS')) {
-                     await processDepositServerSide(transactionId);
-                } else {
-                    console.warn("Payment verification failed or status not completed:", data);
+                    if (paymentStatus === 'COMPLETED' || paymentStatus === 'SUCCESS') {
+                         await processDepositServerSide(transactionId);
+                    } else {
+                        console.warn("Payment verification failed or status not completed:", data);
+                    }
                 }
             }
         } catch (e) {
@@ -298,7 +319,6 @@ app.post('/api/payment/init', async (req, res) => {
              const apiUrl = settings?.uddoktapay?.api_url;
              if (!apiKey || !apiUrl) return res.status(500).json({ error: 'UddoktaPay is not configured in Admin Settings.' });
              
-             // Determine server base URL. Prioritize env var, fallback to request host.
              const protocol = req.headers['x-forwarded-proto'] || 'http';
              const host = req.headers.host;
              const serverBaseUrl = process.env.SELF_URL || `${protocol}://${host}`;
@@ -312,7 +332,7 @@ app.post('/api/payment/init', async (req, res) => {
                 metadata: { user_id: userId, transaction_id: transaction.id },
                 redirect_url: `${serverBaseUrl}/api/payment/success?${returnUrlParams}`,
                 cancel_url: `${serverBaseUrl}/api/payment/cancel?${returnUrlParams}`,
-                webhook_url: `${serverBaseUrl}/api/payment/webhook` // Optional if not using webhook
+                webhook_url: `${serverBaseUrl}/api/payment/webhook`
             };
 
             try {
@@ -377,7 +397,6 @@ app.post('/api/payment/verify', async (req, res) => {
 
         if (!apiKey || !apiUrl) return res.status(500).json({ error: 'Gateway configuration missing.' });
 
-        // Construct Verify URL Dynamically
         let verifyUrl = apiUrl;
         if (verifyUrl.endsWith('/checkout-v2')) {
             verifyUrl = verifyUrl.replace('/checkout-v2', '/verify-payment');
@@ -402,12 +421,23 @@ app.post('/api/payment/verify', async (req, res) => {
                 console.error("Verify Response Parse Error:", responseText);
                 return res.status(502).json({ error: 'Invalid response from gateway.' });
             }
+            
+            // Log the response to Supabase
+            await logGatewayResponse(invoiceId, transactionId, data);
 
-            if (data.status && (data.data?.status === 'COMPLETED' || data.data?.status === 'SUCCESS')) {
+            // Flexible status check: supports root-level 'status' or nested 'data.status'
+            let paymentStatus = null;
+            if (typeof data.status === 'string') {
+                paymentStatus = data.status;
+            } else if (data.data && data.data.status) {
+                 paymentStatus = data.data.status;
+            }
+
+            if (paymentStatus === 'COMPLETED' || paymentStatus === 'SUCCESS') {
                  const success = await processDepositServerSide(transactionId);
                  return res.json({ success: success, message: success ? 'Verified and Updated' : 'Verified but Database Update Failed' });
             } else {
-                return res.status(400).json({ error: `Payment status is ${data.data?.status || 'Unknown'}.` });
+                return res.status(400).json({ error: `Payment status is ${paymentStatus || 'Unknown'}.` });
             }
         } catch (fetchError) {
             console.error("UddoktaPay Verify fetch error:", fetchError);
