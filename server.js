@@ -131,20 +131,58 @@ async function processDepositServerSide(transactionId) {
 
 const handleGatewayRedirect = (req, res, status) => {
     const frontendUrl = req.query.frontend_url || req.body.frontend_url;
-    const transactionId = req.query.transaction_id || req.body.transaction_id;
-    const invoiceId = req.query.invoice_id || req.body.invoice_id;
-
+    
     if (frontendUrl) {
         let redirectUrl = `${frontendUrl}/#/wallet?payment=${status}`;
-        if (transactionId) redirectUrl += `&transaction_id=${transactionId}`;
-        if (invoiceId) redirectUrl += `&invoice_id=${invoiceId}`;
         res.redirect(303, redirectUrl);
     } else {
         res.send(`Payment ${status}. Please close this window.`);
     }
 };
 
-app.all('/api/payment/success', (req, res) => handleGatewayRedirect(req, res, 'success'));
+app.all('/api/payment/success', async (req, res) => {
+    const frontendUrl = req.query.frontend_url || req.body.frontend_url;
+    const transactionId = req.query.transaction_id || req.body.transaction_id;
+    const invoiceId = req.query.invoice_id || req.body.invoice_id;
+
+    // Auto-verify if invoice info is present
+    if (invoiceId && transactionId && isValidUuid(transactionId)) {
+        try {
+             const { data: settingsData } = await supabase
+                .from('app_settings')
+                .select('value')
+                .eq('key', 'deposit_gateway_settings')
+                .single();
+            
+            const apiKey = settingsData?.value?.uddoktapay?.api_key;
+
+            if (apiKey) {
+                const verifyUrl = "https://uddoktapay.com/api/verify-payment";
+                // Need to use fetch - usually available in Node 18+. If older node, ensure node-fetch is installed or use https module.
+                // Assuming Node 18+ or fetch polyfill environment.
+                const response = await fetch(verifyUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'RT-UDDOKTAPAY-API-KEY': apiKey },
+                    body: JSON.stringify({ invoice_id: invoiceId })
+                });
+                const data = await response.json();
+
+                if (data.status && (data.data?.status === 'COMPLETED' || data.data?.status === 'SUCCESS')) {
+                     await processDepositServerSide(transactionId);
+                }
+            }
+        } catch (e) {
+            console.error("Auto-verification error on success redirect:", e);
+        }
+    }
+
+    if (frontendUrl) {
+        res.redirect(303, `${frontendUrl}/#/wallet?payment=success`);
+    } else {
+        res.send(`Payment Successful. You can close this window.`);
+    }
+});
+
 app.all('/api/payment/cancel', (req, res) => handleGatewayRedirect(req, res, 'cancel'));
 
 app.post('/api/payment/init', async (req, res) => {
