@@ -53,8 +53,8 @@ function isValidUuid(id) {
     return typeof id === 'string' && regex.test(id);
 }
 
-async function processDepositServerSide(transactionId) {
-    console.log(`Processing deposit for TxID: ${transactionId}`);
+async function processDepositServerSide(transactionId, paymentMethod = null) {
+    console.log(`Processing deposit for TxID: ${transactionId} via ${paymentMethod || 'unknown'}`);
     
     if (!isValidUuid(transactionId)) {
         console.error(`Invalid UUID provided for deposit processing: ${transactionId}`);
@@ -80,9 +80,14 @@ async function processDepositServerSide(transactionId) {
         }
 
         // 2. Update Transaction to COMPLETED
+        const updateData = { status: 'COMPLETED' };
+        if (paymentMethod) {
+            updateData.description = `Auto Deposit via ${paymentMethod}`;
+        }
+
         const { error: updateError } = await supabase
             .from('transactions')
-            .update({ status: 'COMPLETED' })
+            .update(updateData)
             .eq('id', transactionId);
         
         if (updateError) {
@@ -266,14 +271,18 @@ app.all('/api/payment/success', async (req, res) => {
                     
                     // Flexible status check: supports root-level 'status' or nested 'data.status'
                     let paymentStatus = null;
+                    let paymentMethod = null;
+
                     if (typeof data.status === 'string') {
                         paymentStatus = data.status;
+                        paymentMethod = data.payment_method;
                     } else if (data.data && data.data.status) {
                          paymentStatus = data.data.status;
+                         paymentMethod = data.data.payment_method;
                     }
 
                     if (paymentStatus === 'COMPLETED' || paymentStatus === 'SUCCESS') {
-                         await processDepositServerSide(transactionId);
+                         await processDepositServerSide(transactionId, paymentMethod);
                     } else {
                         console.warn("Payment verification failed or status not completed:", data);
                     }
@@ -431,14 +440,18 @@ app.post('/api/payment/verify', async (req, res) => {
 
             // Flexible status check: supports root-level 'status' or nested 'data.status'
             let paymentStatus = null;
+            let paymentMethod = null;
+
             if (typeof data.status === 'string') {
                 paymentStatus = data.status;
+                paymentMethod = data.payment_method;
             } else if (data.data && data.data.status) {
                  paymentStatus = data.data.status;
+                 paymentMethod = data.data.payment_method;
             }
 
             if (paymentStatus === 'COMPLETED' || paymentStatus === 'SUCCESS') {
-                 const success = await processDepositServerSide(transactionId);
+                 const success = await processDepositServerSide(transactionId, paymentMethod);
                  return res.json({ success: success, message: success ? 'Verified and Updated' : 'Verified but Database Update Failed' });
             } else {
                 return res.status(400).json({ error: `Payment status is ${paymentStatus || 'Unknown'}.` });
