@@ -27,6 +27,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const games = new Map();
 const supportClients = new Map(); // userId -> WebSocket
 const adminSupportClients = new Set(); // Set<WebSocket>
+const groupChatClients = new Set(); // Set<WebSocket> for global chat
 
 const app = express();
 
@@ -448,9 +449,81 @@ app.post('/api/payment/verify', async (req, res) => {
     }
 });
 
-// --- Unified WebSocket Logic (Game + Support) ---
+// --- Unified WebSocket Logic (Game + Support + Group) ---
 wss.on('connection', (ws, req) => {
-    const url = req.url; // e.g., "/ABC123" or "/support"
+    const url = req.url; 
+
+    // --- GROUP CHAT HANDLING ---
+    if (url === '/group-chat') {
+        ws.isGroupChat = true;
+        
+        ws.on('message', async (message) => {
+            try {
+                const { type, payload } = JSON.parse(message);
+
+                if (type === 'AUTH') {
+                    if (ws.userId) return; 
+
+                    const { data: { user }, error } = await supabase.auth.getUser(payload.token);
+                    if (error || !user) {
+                        ws.send(JSON.stringify({ type: 'ERROR', payload: { message: 'Authentication failed' } }));
+                        ws.close(4001, 'Auth Failed');
+                        return;
+                    }
+                    
+                    const { data: profile } = await supabase.from('profiles').select('username').eq('id', user.id).single();
+
+                    ws.userId = user.id;
+                    ws.username = profile?.username || 'User';
+                    
+                    groupChatClients.add(ws);
+                    ws.send(JSON.stringify({ type: 'AUTH_SUCCESS' }));
+                    return;
+                }
+
+                if (!ws.userId) {
+                    ws.send(JSON.stringify({ type: 'ERROR', payload: { message: 'Not authenticated' } }));
+                    return;
+                }
+
+                if (type === 'SEND_MESSAGE') {
+                    const { message_text } = payload;
+                    
+                    // Save to DB
+                    const { data: savedMsg, error } = await supabase
+                        .from('group_chat_messages')
+                        .insert({
+                            user_id: ws.userId,
+                            username: ws.username,
+                            message_text: message_text
+                        })
+                        .select()
+                        .single();
+
+                    if (error) throw error;
+
+                    const msgPayload = { type: 'NEW_MESSAGE', payload: savedMsg };
+                    const msgString = JSON.stringify(msgPayload);
+
+                    // Broadcast to all connected group chat clients
+                    for (const client of groupChatClients) {
+                        if (client.readyState === 1) {
+                            client.send(msgString);
+                        }
+                    }
+                }
+
+            } catch (e) {
+                console.error("Group chat error:", e);
+                ws.send(JSON.stringify({ type: 'ERROR', payload: { message: 'Internal server error' } }));
+            }
+        });
+
+        ws.on('close', () => {
+            groupChatClients.delete(ws);
+        });
+        return;
+    }
 
     // --- SUPPORT CHAT HANDLING ---
     if (url === '/support') {
@@ -511,7 +584,6 @@ wss.on('connection', (ws, req) => {
                         }
                     } else {
                         // User typing to admin(s)
-                        // (Optional for now based on requirements, but good to have)
                         for (const adminWs of adminSupportClients) {
                             if (adminWs.readyState === 1) {
                                 adminWs.send(msgString);
