@@ -1,4 +1,3 @@
-
 // /dream-ludo-server/server.js
 require('dotenv').config();
 const express = require('express');
@@ -113,11 +112,73 @@ async function processDepositServerSide(transactionId) {
 
         console.log(`Added ${depositAmount} to user ${tx.user_id}. New Balance: ${newBalance}`);
 
-        // 5. Handle Referrals (Simplified logic for server-side)
-        // Ideally, this should trigger a database function or replicate the logic from the SQL function `process_deposit`.
-        // For robustness, we can try calling the existing RPC if we had admin context, but here we do direct DB updates.
-        // We will skip complex referral logic here to keep this safe and simple, relying on the transaction completion.
-        // If referral logic is critical here, it should be moved to a shared PL/pgSQL function that we can call via RPC.
+        // 5. Handle Referral Bonuses (Server-Side Implementation)
+        // Check if this is the FIRST completed deposit for this user
+        const { count } = await supabase
+            .from('transactions')
+            .select('*', { count: 'exact', head: true })
+            .eq('user_id', tx.user_id)
+            .eq('type', 'DEPOSIT')
+            .eq('status', 'COMPLETED');
+
+        // If count is 1, it means this is the first one (we just updated it to COMPLETED above)
+        // If there were previous ones, count would be > 1
+        if (count === 1 && profile.referred_by) {
+            console.log(`First deposit detected for referred user ${tx.user_id}. Processing bonuses...`);
+            
+            // Fetch Bonus Settings
+            const { data: refSettings } = await supabase
+                .from('app_settings')
+                .select('key, value')
+                .in('key', ['referral_bonus_amount', 'referee_bonus_amount']);
+            
+            const getSetting = (key) => {
+                const s = refSettings?.find(item => item.key === key);
+                return s?.value?.amount || 0;
+            };
+
+            const referrerBonus = getSetting('referral_bonus_amount');
+            const refereeBonus = getSetting('referee_bonus_amount');
+
+            // Credit Referrer
+            if (referrerBonus > 0) {
+                const { data: referrerProfile } = await supabase.from('profiles').select('deposit_balance, username').eq('id', profile.referred_by).single();
+                if (referrerProfile) {
+                     await supabase.from('profiles').update({ 
+                         deposit_balance: Number(referrerProfile.deposit_balance) + referrerBonus 
+                     }).eq('id', profile.referred_by);
+                     
+                     await supabase.from('transactions').insert({
+                         user_id: profile.referred_by,
+                         amount: referrerBonus,
+                         type: 'REFERRAL_BONUS',
+                         status: 'COMPLETED',
+                         description: `Referral bonus from ${profile.username}`,
+                         source_user_id: tx.user_id
+                     });
+                     console.log(`Credited referrer ${profile.referred_by} with ${referrerBonus}`);
+                }
+            }
+
+            // Credit Referee (The current user)
+            if (refereeBonus > 0) {
+                // Re-fetch profile to get latest balance
+                const { data: updatedProfile } = await supabase.from('profiles').select('deposit_balance').eq('id', tx.user_id).single();
+                
+                await supabase.from('profiles').update({ 
+                     deposit_balance: Number(updatedProfile.deposit_balance) + refereeBonus 
+                }).eq('id', tx.user_id);
+
+                await supabase.from('transactions').insert({
+                    user_id: tx.user_id,
+                    amount: refereeBonus,
+                    type: 'REFERRAL_BONUS',
+                    status: 'COMPLETED',
+                    description: 'Sign-up bonus for using a referral code.'
+                });
+                console.log(`Credited referee ${tx.user_id} with ${refereeBonus}`);
+            }
+        }
 
         return true;
     } catch (e) {
@@ -154,25 +215,47 @@ app.all('/api/payment/success', async (req, res) => {
                 .eq('key', 'deposit_gateway_settings')
                 .single();
             
-            const apiKey = settingsData?.value?.uddoktapay?.api_key;
+            const settings = settingsData?.value?.uddoktapay;
+            const apiKey = settings?.api_key;
+            const apiUrl = settings?.api_url;
 
-            if (apiKey) {
-                const verifyUrl = "https://uddoktapay.com/api/verify-payment";
-                // Need to use fetch - usually available in Node 18+. If older node, ensure node-fetch is installed or use https module.
-                // Assuming Node 18+ or fetch polyfill environment.
+            if (apiKey && apiUrl) {
+                // Dynamically construct verify URL. Replace 'checkout-v2' with 'verify-payment'
+                // or if URL structure is different, append /verify-payment to the base.
+                // Standard V2 API: .../api/checkout-v2  -> .../api/verify-payment
+                let verifyUrl = apiUrl;
+                if (verifyUrl.endsWith('/checkout-v2')) {
+                    verifyUrl = verifyUrl.replace('/checkout-v2', '/verify-payment');
+                } else if (verifyUrl.endsWith('/checkout-v2/')) {
+                     verifyUrl = verifyUrl.replace('/checkout-v2/', '/verify-payment');
+                } else {
+                    // Fallback: try to use it as base if it doesn't have specific endpoint
+                    verifyUrl = verifyUrl.replace(/\/$/, '') + '/verify-payment';
+                }
+
                 const response = await fetch(verifyUrl, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'RT-UDDOKTAPAY-API-KEY': apiKey },
                     body: JSON.stringify({ invoice_id: invoiceId })
                 });
-                const data = await response.json();
+                
+                // Safe response handling
+                const responseText = await response.text();
+                let data;
+                try {
+                    data = JSON.parse(responseText);
+                } catch (parseError) {
+                    console.error("Failed to parse Gateway response as JSON:", responseText);
+                }
 
-                if (data.status && (data.data?.status === 'COMPLETED' || data.data?.status === 'SUCCESS')) {
+                if (data && data.status && (data.data?.status === 'COMPLETED' || data.data?.status === 'SUCCESS')) {
                      await processDepositServerSide(transactionId);
+                } else {
+                    console.warn("Payment verification failed or status not completed:", data);
                 }
             }
         } catch (e) {
-            console.error("Auto-verification error on success redirect:", e);
+            console.error("Auto-verification exception:", e);
         }
     }
 
@@ -238,7 +321,15 @@ app.post('/api/payment/init', async (req, res) => {
                     headers: { 'Content-Type': 'application/json', 'RT-UDDOKTAPAY-API-KEY': apiKey },
                     body: JSON.stringify(payload)
                 });
-                const data = await response.json();
+                
+                const responseText = await response.text();
+                let data;
+                try {
+                    data = JSON.parse(responseText);
+                } catch (e) {
+                    console.error("Init Payment Parse Error. Body:", responseText);
+                    return res.status(502).json({ error: 'Received invalid response from payment gateway.' });
+                }
                 
                 if (data.status && data.payment_url) {
                     return res.json({ payment_url: data.payment_url });
@@ -266,7 +357,6 @@ app.post('/api/payment/verify', async (req, res) => {
             return res.status(400).json({ error: 'Missing transactionId or invoiceId.' });
         }
         
-        // Check for "undefined" string specifically which can come from frontend bugs
         if (transactionId === 'undefined' || invoiceId === 'undefined') {
              return res.status(400).json({ error: 'Invalid ID format (undefined).' });
         }
@@ -281,11 +371,21 @@ app.post('/api/payment/verify', async (req, res) => {
             .eq('key', 'deposit_gateway_settings')
             .single();
         
-        const apiKey = settingsData?.value?.uddoktapay?.api_key;
-        if (!apiKey) return res.status(500).json({ error: 'Gateway API Key not found in settings.' });
+        const settings = settingsData?.value?.uddoktapay;
+        const apiKey = settings?.api_key;
+        const apiUrl = settings?.api_url;
 
-        // Call Gateway Verify API
-        const verifyUrl = "https://uddoktapay.com/api/verify-payment";
+        if (!apiKey || !apiUrl) return res.status(500).json({ error: 'Gateway configuration missing.' });
+
+        // Construct Verify URL Dynamically
+        let verifyUrl = apiUrl;
+        if (verifyUrl.endsWith('/checkout-v2')) {
+            verifyUrl = verifyUrl.replace('/checkout-v2', '/verify-payment');
+        } else if (verifyUrl.endsWith('/checkout-v2/')) {
+                verifyUrl = verifyUrl.replace('/checkout-v2/', '/verify-payment');
+        } else {
+            verifyUrl = verifyUrl.replace(/\/$/, '') + '/verify-payment';
+        }
         
         try {
             const response = await fetch(verifyUrl, {
@@ -294,7 +394,14 @@ app.post('/api/payment/verify', async (req, res) => {
                 body: JSON.stringify({ invoice_id: invoiceId })
             });
 
-            const data = await response.json();
+            const responseText = await response.text();
+            let data;
+            try {
+                data = JSON.parse(responseText);
+            } catch (e) {
+                console.error("Verify Response Parse Error:", responseText);
+                return res.status(502).json({ error: 'Invalid response from gateway.' });
+            }
 
             if (data.status && (data.data?.status === 'COMPLETED' || data.data?.status === 'SUCCESS')) {
                  const success = await processDepositServerSide(transactionId);
@@ -319,14 +426,6 @@ app.post('/api/payment/verify', async (req, res) => {
 wss.on('connection', (ws, req) => {
     const gameCode = req.url.slice(1).toUpperCase();
     
-    // Allow connection even if game doesn't exist yet, logic will handle creation or rejection
-    // Ideally, we should check if the gameCode is valid or pre-created.
-    // For simplicity in this unified server, we lazily create the map entry if it's a valid flow.
-    
-    // However, to prevent memory leaks from random URL connections, 
-    // we should ideally only allow connecting to existing games or authorized creations.
-    // Here we'll allow it but clean up quickly if empty.
-
     ws.on('message', async (message) => {
         try {
             const { action, payload } = JSON.parse(message);
@@ -345,12 +444,8 @@ wss.on('connection', (ws, req) => {
                 ws.userName = user.user_metadata.full_name || 'Player';
                 ws.gameCode = gameCode;
                 
-                // Get or create game room
                 let game = games.get(gameCode);
                 if (!game) {
-                    // If game doesn't exist in memory, try to fetch from DB to see if it's a valid tournament
-                    // This is a simplification. In a real app, we'd load state from DB.
-                    // For now, we create a new empty game state if it's the first user.
                     const options = { hostId: ws.userId, hostName: ws.userName, type: 'manual' };
                     const gameState = createNewGame(gameCode, options);
                     game = { state: gameState, clients: new Map(), turnTimer: null };
@@ -359,16 +454,12 @@ wss.on('connection', (ws, req) => {
 
                 game.clients.set(ws.userId, ws);
 
-                // Add player if not already in state
                 if (!game.state.players.some(p => p.playerId === ws.userId)) {
                     addPlayer(game.state, ws.userId, ws.userName);
                 }
 
                 ws.send(JSON.stringify({ type: 'AUTH_SUCCESS' }));
-                // Send immediate state update
                 ws.send(JSON.stringify({ type: 'GAME_STATE_UPDATE', payload: game.state }));
-                
-                // Broadcast join
                 broadcastGameState(gameCode);
                 return;
             }
@@ -378,26 +469,22 @@ wss.on('connection', (ws, req) => {
             const game = games.get(gameCode);
             if (!game) return;
 
-            // Basic rate limiting could go here
-
             switch (action) {
                 case 'START_GAME': await startGame(game.state, ws.userId, supabase); break;
                 case 'ROLL_DICE': 
                     initiateRoll(game.state, ws.userId);
                     broadcastGameState(gameCode);
-                    // Simulate roll delay
                     setTimeout(async () => {
                         const rolledAgain = await completeRoll(game.state, ws.userId, supabase);
                         broadcastGameState(gameCode);
                         if (rolledAgain) {
-                            // If no moves possible, auto advance after short delay
                              setTimeout(async () => {
-                                await handleMissedTurn(game.state, supabase); // Or just advanceTurn
+                                await handleMissedTurn(game.state, supabase);
                                 broadcastGameState(gameCode);
                              }, 1000);
                         }
                     }, 500);
-                    return; // Special handling for async roll
+                    return;
                 case 'MOVE_PIECE': await movePiece(game.state, ws.userId, payload.pieceId, supabase); break;
                 case 'LEAVE_GAME': await leaveGame(game.state, ws.userId, supabase); break;
                 case 'SEND_CHAT_MESSAGE': await sendChatMessage(game.state, ws.userId, payload.text, supabase); break;
@@ -416,17 +503,12 @@ wss.on('connection', (ws, req) => {
         const game = games.get(ws.gameCode);
         if (game && ws.userId) {
             game.clients.delete(ws.userId);
-            // Optional: Mark as disconnected in game state immediately or wait for reconnect?
-            // For Ludo, usually we just leave them as "inactive" until they timeout.
-            // But if they explicitly closed, we might want to notify.
-            
             if (game.clients.size === 0) {
-                // Clean up empty games after a timeout to allow reconnects
                 setTimeout(() => {
                     if (game.clients.size === 0) {
                         games.delete(ws.gameCode);
                     }
-                }, 60000); // 1 minute cleanup
+                }, 60000);
             }
         }
     });
@@ -435,9 +517,7 @@ wss.on('connection', (ws, req) => {
 function broadcastGameState(gameCode) {
     const game = games.get(gameCode);
     if (!game) return;
-
     const statePayload = JSON.stringify({ type: 'GAME_STATE_UPDATE', payload: game.state });
-
     for (const client of game.clients.values()) {
         if (client.readyState === client.OPEN) {
             client.send(statePayload);
