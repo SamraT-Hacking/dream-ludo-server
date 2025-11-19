@@ -1,3 +1,4 @@
+
 // /dream-ludo-server/server.js
 require('dotenv').config();
 const express = require('express');
@@ -207,7 +208,9 @@ async function logGatewayResponse(invoiceId, transactionId, data) {
             invoice_id: invoiceId,
             transaction_id: transactionId,
             gateway: 'uddoktapay',
-            raw_response: data
+            raw_response: data,
+            sender_number: data.sender_number || null,
+            payment_method: data.payment_method || null
         });
         if (error) console.warn('Failed to insert gateway log:', error.message);
     } catch (e) {
@@ -258,6 +261,7 @@ app.all('/api/payment/success', async (req, res) => {
                 }
                 
                 if (data) {
+                    // Log response, even if it's a failure
                     await logGatewayResponse(invoiceId, transactionId, data);
                     
                     // Flexible status check: supports root-level 'status' or nested 'data.status'
