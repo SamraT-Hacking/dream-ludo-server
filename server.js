@@ -212,6 +212,28 @@ async function logGatewayResponse(invoiceId, transactionId, data, gateway = 'udd
     }
 }
 
+// --- NEW ENDPOINT: Check and Cancel Abandoned Transaction ---
+app.post('/api/payment/check-cancel', async (req, res) => {
+    const { transactionId } = req.body;
+    if (!transactionId || !isValidUuid(transactionId)) return res.status(400).json({error: 'Invalid ID'});
+    
+    try {
+        // Only cancel if it's still PENDING. If it's COMPLETED, do nothing.
+        const { data } = await supabase.from('transactions').select('status').eq('id', transactionId).single();
+        
+        if (data && data.status === 'PENDING') {
+            await supabase
+                .from('transactions')
+                .update({ status: 'FAILED', description: 'Cancelled/Abandoned by User' })
+                .eq('id', transactionId);
+            return res.json({ status: 'cancelled' });
+        }
+        return res.json({ status: data ? data.status : 'not_found' });
+    } catch(e) {
+        return res.status(500).json({error: e.message});
+    }
+});
+
 app.all('/api/payment/success', async (req, res) => {
     const frontendUrl = req.query.frontend_url || req.body.frontend_url;
     const transactionId = req.query.transaction_id || req.body.transaction_id;
@@ -364,7 +386,8 @@ app.post('/api/payment/init', async (req, res) => {
                 }
                 
                 if (data.status && data.payment_url) {
-                    return res.json({ payment_url: data.payment_url });
+                    // Pass transactionId back
+                    return res.json({ payment_url: data.payment_url, transactionId: transaction.id });
                 } else {
                     return res.status(400).json({ error: data.message || 'Gateway returned an error.' });
                 }
@@ -384,7 +407,7 @@ app.post('/api/payment/init', async (req, res) => {
 
              // Return a link to our internal processing endpoint which will auto-submit the form
              const processUrl = `${serverBaseUrl}/api/payment/paytm-process/${transaction.id}?redirect_base=${encodeURIComponent(redirectBaseUrl)}`;
-             return res.json({ payment_url: processUrl });
+             return res.json({ payment_url: processUrl, transactionId: transaction.id });
         }
 
         // --- RAZORPAY HANDLING ---
@@ -420,7 +443,7 @@ app.post('/api/payment/init', async (req, res) => {
             try {
                 const linkData = await RazorpayUtils.createPaymentLink(params, keyId, keySecret);
                 if (linkData.short_url) {
-                    return res.json({ payment_url: linkData.short_url });
+                    return res.json({ payment_url: linkData.short_url, transactionId: transaction.id });
                 } else {
                     throw new Error('No short_url returned from Razorpay');
                 }
