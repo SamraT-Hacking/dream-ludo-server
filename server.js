@@ -57,9 +57,6 @@ function isValidUuid(id) {
     return typeof id === 'string' && regex.test(id);
 }
 
-// ... (processDepositServerSide and handleGatewayRedirect logic remains unchanged)
-// To keep the response concise while updating the file fully, I will include the payment logic below.
-
 async function processDepositServerSide(transactionId, paymentMethod = null) {
     console.log(`Processing deposit for TxID: ${transactionId} via ${paymentMethod || 'unknown'}`);
     
@@ -490,12 +487,37 @@ wss.on('connection', (ws, req) => {
                     }
 
                     ws.send(JSON.stringify({ type: 'AUTH_SUCCESS', payload: { userId: ws.userId, role: ws.userRole } }));
-                    // console.log(`Support Chat: User ${ws.userId} (${ws.userRole}) connected.`);
                     return;
                 }
 
                 if (!ws.userId) {
                     ws.send(JSON.stringify({ type: 'ERROR', payload: { message: 'Not authenticated' } }));
+                    return;
+                }
+
+                // NEW: Handle TYPING event
+                if (type === 'TYPING') {
+                    const { target_user_id, isTyping } = payload;
+                    const isSenderAdmin = ws.userRole === 'admin';
+                    
+                    // Relay typing status
+                    const msgString = JSON.stringify({ type: 'TYPING_STATUS', payload: { userId: ws.userId, isTyping } });
+
+                    if (isSenderAdmin) {
+                        // Admin typing to specific user
+                        const userSocket = supportClients.get(target_user_id);
+                        if (userSocket && userSocket.readyState === 1) {
+                            userSocket.send(msgString);
+                        }
+                    } else {
+                        // User typing to admin(s)
+                        // (Optional for now based on requirements, but good to have)
+                        for (const adminWs of adminSupportClients) {
+                            if (adminWs.readyState === 1) {
+                                adminWs.send(msgString);
+                            }
+                        }
+                    }
                     return;
                 }
 
@@ -548,7 +570,6 @@ wss.on('connection', (ws, req) => {
             if (ws.userId) {
                 supportClients.delete(ws.userId);
                 adminSupportClients.delete(ws);
-                // console.log(`Support Chat: User ${ws.userId} disconnected.`);
             }
         });
 
