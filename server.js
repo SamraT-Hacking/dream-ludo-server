@@ -6,6 +6,7 @@ const { createServer } = require('http');
 const { WebSocketServer } = require('ws');
 const { createClient } = require('@supabase/supabase-js');
 const PaytmChecksum = require('./paytmChecksum'); // Import Paytm utility
+const RazorpayUtils = require('./razorpayUtils'); // Import Razorpay utility
 
 const {
     createNewGame, addPlayer, startGame,
@@ -301,7 +302,7 @@ app.all('/api/payment/cancel', async (req, res) => {
 
 app.post('/api/payment/init', async (req, res) => {
     try {
-        const { userId, amount, gateway, redirectBaseUrl, userEmail, userName } = req.body;
+        const { userId, amount, gateway, redirectBaseUrl, userEmail, userName, userPhone } = req.body;
         
          if (!userId || !amount || !redirectBaseUrl) {
             return res.status(400).json({ error: 'Missing required fields: userId, amount, or redirectBaseUrl.' });
@@ -384,6 +385,49 @@ app.post('/api/payment/init', async (req, res) => {
              // Return a link to our internal processing endpoint which will auto-submit the form
              const processUrl = `${serverBaseUrl}/api/payment/paytm-process/${transaction.id}?redirect_base=${encodeURIComponent(redirectBaseUrl)}`;
              return res.json({ payment_url: processUrl });
+        }
+
+        // --- RAZORPAY HANDLING ---
+        if (gateway === 'razorpay') {
+            const keyId = settings?.razorpay?.key_id;
+            const keySecret = settings?.razorpay?.key_secret;
+
+            if (!keyId || !keySecret) return res.status(500).json({ error: 'Razorpay is not configured.' });
+
+            const callbackUrl = `${serverBaseUrl}/api/payment/razorpay-callback?frontend_url=${encodeURIComponent(redirectBaseUrl)}&transaction_id=${transaction.id}`;
+
+            // Razorpay creates a payment link.
+            const params = {
+                amount: Math.round(amount * 100), // Amount in paise
+                currency: "INR", // Razorpay uses INR by default
+                accept_partial: false,
+                reference_id: transaction.id,
+                description: `Deposit by ${userName}`,
+                customer: {
+                    name: userName,
+                    email: userEmail,
+                    contact: userPhone || "+919999999999"
+                },
+                notify: {
+                    sms: true,
+                    email: true
+                },
+                reminder_enable: true,
+                callback_url: callbackUrl,
+                callback_method: "get"
+            };
+
+            try {
+                const linkData = await RazorpayUtils.createPaymentLink(params, keyId, keySecret);
+                if (linkData.short_url) {
+                    return res.json({ payment_url: linkData.short_url });
+                } else {
+                    throw new Error('No short_url returned from Razorpay');
+                }
+            } catch (e) {
+                console.error("Razorpay Init Error:", e);
+                return res.status(500).json({ error: `Razorpay Init Failed: ${e.message}` });
+            }
         }
 
         return res.status(400).json({ error: 'Invalid or unsupported gateway selected.' });
@@ -494,6 +538,49 @@ app.post('/api/payment/paytm-callback', async (req, res) => {
         res.redirect(303, `${frontend_url}/#/wallet?payment=cancel`);
     } else {
         res.send("Payment Failed or Processed. Please close this window.");
+    }
+});
+
+// --- RAZORPAY CALLBACK ---
+
+app.get('/api/payment/razorpay-callback', async (req, res) => {
+    const { frontend_url, transaction_id, ...razorpayParams } = req.query;
+    const { razorpay_payment_link_status } = razorpayParams;
+
+    if (!isValidUuid(transaction_id)) return res.status(400).send("Invalid Transaction ID");
+
+    try {
+        const { data: settingsData } = await supabase.from('app_settings').select('value').eq('key', 'deposit_gateway_settings').single();
+        const settings = settingsData?.value?.razorpay;
+        
+        if (!settings?.key_secret) throw new Error("Razorpay config missing");
+
+        const isValid = RazorpayUtils.verifySignature(razorpayParams, settings.key_secret);
+
+        if (isValid) {
+             await logGatewayResponse(razorpayParams.razorpay_payment_link_id, transaction_id, razorpayParams, 'razorpay');
+
+             if (razorpay_payment_link_status === 'paid') {
+                 await processDepositServerSide(transaction_id, 'Razorpay');
+                 if (frontend_url) {
+                     return res.redirect(303, `${frontend_url}/#/wallet?payment=success`);
+                 }
+             } else {
+                 await supabase.from('transactions').update({ status: 'FAILED', description: `Razorpay status: ${razorpay_payment_link_status}` }).eq('id', transaction_id);
+             }
+        } else {
+            console.error("Razorpay Signature Mismatch");
+            await supabase.from('transactions').update({ status: 'FAILED', description: 'Razorpay Signature Verification Failed' }).eq('id', transaction_id);
+        }
+
+    } catch (e) {
+        console.error("Razorpay Callback Error:", e);
+    }
+
+    if (frontend_url) {
+        res.redirect(303, `${frontend_url}/#/wallet?payment=cancel`);
+    } else {
+        res.send("Processing Complete. Please close this window.");
     }
 });
 
