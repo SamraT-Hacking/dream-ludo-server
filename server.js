@@ -5,6 +5,7 @@ const express = require('express');
 const { createServer } = require('http');
 const { WebSocketServer } = require('ws');
 const { createClient } = require('@supabase/supabase-js');
+const PaytmChecksum = require('./paytmChecksum'); // Import Paytm utility
 
 const {
     createNewGame, addPlayer, startGame,
@@ -194,15 +195,15 @@ const handleGatewayRedirect = (req, res, status) => {
     }
 };
 
-async function logGatewayResponse(invoiceId, transactionId, data) {
+async function logGatewayResponse(invoiceId, transactionId, data, gateway = 'uddoktapay') {
     try {
         const { error } = await supabase.from('deposit_gateway_logs').insert({
             invoice_id: invoiceId,
             transaction_id: transactionId,
-            gateway: 'uddoktapay',
+            gateway: gateway,
             raw_response: data,
             sender_number: data.sender_number || null,
-            payment_method: data.payment_method || null
+            payment_method: data.payment_method || data.PAYMENTMODE || null
         });
         if (error) console.warn('Failed to insert gateway log:', error.message);
     } catch (e) {
@@ -284,7 +285,6 @@ app.all('/api/payment/success', async (req, res) => {
 
 app.all('/api/payment/cancel', async (req, res) => {
     const transactionId = req.query.transaction_id || req.body.transaction_id;
-
     // Update status to FAILED when user cancels at gateway
     if (transactionId && isValidUuid(transactionId)) {
         try {
@@ -296,7 +296,6 @@ app.all('/api/payment/cancel', async (req, res) => {
             console.error("Error marking transaction as cancelled:", e);
         }
     }
-    
     handleGatewayRedirect(req, res, 'cancel');
 });
 
@@ -307,6 +306,10 @@ app.post('/api/payment/init', async (req, res) => {
          if (!userId || !amount || !redirectBaseUrl) {
             return res.status(400).json({ error: 'Missing required fields: userId, amount, or redirectBaseUrl.' });
         }
+        
+        const protocol = req.headers['x-forwarded-proto'] || 'http';
+        const host = req.headers.host;
+        const serverBaseUrl = process.env.SELF_URL || `${protocol}://${host}`;
 
         const { data: transaction, error: txError } = await supabase
             .from('transactions')
@@ -325,14 +328,11 @@ app.post('/api/payment/init', async (req, res) => {
         const { data: settingsData } = await supabase.from('app_settings').select('value').eq('key', 'deposit_gateway_settings').single();
         const settings = settingsData?.value;
         
+        // --- UDDOKTAPAY HANDLING ---
         if (gateway === 'uddoktapay') {
              const apiKey = settings?.uddoktapay?.api_key;
              const apiUrl = settings?.uddoktapay?.api_url;
              if (!apiKey || !apiUrl) return res.status(500).json({ error: 'UddoktaPay is not configured in Admin Settings.' });
-             
-             const protocol = req.headers['x-forwarded-proto'] || 'http';
-             const host = req.headers.host;
-             const serverBaseUrl = process.env.SELF_URL || `${protocol}://${host}`;
              
              const returnUrlParams = `frontend_url=${encodeURIComponent(redirectBaseUrl)}&transaction_id=${transaction.id}`;
              
@@ -372,6 +372,20 @@ app.post('/api/payment/init', async (req, res) => {
                  return res.status(500).json({ error: 'Failed to communicate with payment gateway.' });
             }
         }
+        
+        // --- PAYTM HANDLING ---
+        if (gateway === 'paytm') {
+             const merchantId = settings?.paytm?.merchant_id;
+             const merchantKey = settings?.paytm?.merchant_key;
+             const website = settings?.paytm?.website || 'DEFAULT';
+             
+             if (!merchantId || !merchantKey) return res.status(500).json({ error: 'Paytm is not configured in Admin Settings.' });
+
+             // Return a link to our internal processing endpoint which will auto-submit the form
+             const processUrl = `${serverBaseUrl}/api/payment/paytm-process/${transaction.id}?redirect_base=${encodeURIComponent(redirectBaseUrl)}`;
+             return res.json({ payment_url: processUrl });
+        }
+
         return res.status(400).json({ error: 'Invalid or unsupported gateway selected.' });
 
     } catch (e) {
@@ -379,6 +393,110 @@ app.post('/api/payment/init', async (req, res) => {
         res.status(500).json({ error: `Internal Server Error: ${e.message}` });
     }
 });
+
+// --- PAYTM PROCESS & CALLBACK ENDPOINTS ---
+
+app.get('/api/payment/paytm-process/:txnId', async (req, res) => {
+    const { txnId } = req.params;
+    const { redirect_base } = req.query;
+
+    if (!isValidUuid(txnId)) return res.status(400).send("Invalid Transaction ID");
+
+    try {
+        const { data: transaction } = await supabase.from('transactions').select('*').eq('id', txnId).single();
+        if (!transaction) return res.status(404).send("Transaction not found");
+
+        const { data: settingsData } = await supabase.from('app_settings').select('value').eq('key', 'deposit_gateway_settings').single();
+        const settings = settingsData?.value?.paytm;
+
+        if (!settings?.merchant_id || !settings?.merchant_key) return res.status(500).send("Gateway Configuration Error");
+
+        const protocol = req.headers['x-forwarded-proto'] || 'http';
+        const host = req.headers.host;
+        const serverBaseUrl = process.env.SELF_URL || `${protocol}://${host}`;
+        const callbackUrl = `${serverBaseUrl}/api/payment/paytm-callback?frontend_url=${encodeURIComponent(redirect_base)}&transaction_id=${txnId}`;
+
+        const params = {
+            MID: settings.merchant_id,
+            WEBSITE: settings.website || 'DEFAULT',
+            INDUSTRY_TYPE_ID: 'Retail',
+            CHANNEL_ID: 'WEB',
+            ORDER_ID: txnId, // Use transaction UUID as Order ID
+            CUST_ID: transaction.user_id,
+            TXN_AMOUNT: transaction.amount.toString(),
+            CALLBACK_URL: callbackUrl,
+        };
+
+        const checksum = await PaytmChecksum.generateSignature(params, settings.merchant_key);
+        const paytmUrl = "https://securegw.paytm.in/theia/processTransaction"; // Use 'https://securegw-stage.paytm.in/theia/processTransaction' for Staging
+
+        // HTML form to auto-submit to Paytm
+        res.send(`
+            <html>
+                <head><title>Redirecting to Payment...</title></head>
+                <body>
+                    <center><h1>Please do not refresh this page...</h1></center>
+                    <form method="post" action="${paytmUrl}" name="paytm_form">
+                        ${Object.keys(params).map(key => `<input type="hidden" name="${key}" value="${params[key]}">`).join('')}
+                        <input type="hidden" name="CHECKSUMHASH" value="${checksum}">
+                    </form>
+                    <script type="text/javascript">document.paytm_form.submit();</script>
+                </body>
+            </html>
+        `);
+
+    } catch (e) {
+        console.error("Paytm Process Error:", e);
+        res.status(500).send("Internal Error Processing Payment");
+    }
+});
+
+app.post('/api/payment/paytm-callback', async (req, res) => {
+    const { frontend_url, transaction_id } = req.query;
+    const received_data = req.body;
+    
+    try {
+        const { data: settingsData } = await supabase.from('app_settings').select('value').eq('key', 'deposit_gateway_settings').single();
+        const settings = settingsData?.value?.paytm;
+
+        if (!settings?.merchant_key) throw new Error("Gateway config missing");
+
+        const isValidChecksum = await PaytmChecksum.verifySignature(received_data, settings.merchant_key, received_data.CHECKSUMHASH);
+        
+        if (isValidChecksum) {
+            await logGatewayResponse(received_data.ORDERID, transaction_id, received_data, 'paytm');
+            
+            if (received_data.STATUS === 'TXN_SUCCESS') {
+                // Ensure the amount matches what we expect
+                const { data: transaction } = await supabase.from('transactions').select('amount').eq('id', transaction_id).single();
+                if (transaction && parseFloat(transaction.amount) === parseFloat(received_data.TXNAMOUNT)) {
+                    await processDepositServerSide(transaction_id, 'Paytm');
+                    if (frontend_url) {
+                        return res.redirect(303, `${frontend_url}/#/wallet?payment=success`);
+                    }
+                } else {
+                    console.error("Paytm Amount Mismatch or Transaction Not Found");
+                }
+            } else {
+                // Transaction Failed
+                 if (transaction_id && isValidUuid(transaction_id)) {
+                    await supabase.from('transactions').update({ status: 'FAILED', description: `Paytm Failed: ${received_data.RESPMSG}` }).eq('id', transaction_id);
+                 }
+            }
+        } else {
+            console.error("Paytm Checksum Mismatch");
+        }
+    } catch (e) {
+        console.error("Paytm Callback Error:", e);
+    }
+    
+    if (frontend_url) {
+        res.redirect(303, `${frontend_url}/#/wallet?payment=cancel`);
+    } else {
+        res.send("Payment Failed or Processed. Please close this window.");
+    }
+});
+
 
 app.post('/api/payment/verify', async (req, res) => {
     try {
