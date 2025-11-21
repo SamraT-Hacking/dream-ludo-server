@@ -1,4 +1,3 @@
-
 // /dream-ludo-server/server.js
 require('dotenv').config();
 const express = require('express');
@@ -346,64 +345,97 @@ function broadcastGameState(gameCode) {
     }
 }
 
-// --- Unified WebSocket Logic (Game + Support + Group) ---
+// --- Unified WebSocket Server ---
 wss.on('connection', (ws, req) => {
-    const url = req.url; 
+    const url = req.url;
 
-    // Group Chat & Support Chat logic (omitted for brevity, assume unchanged from previous)
     if (url === '/group-chat') {
         ws.isGroupChat = true;
         ws.on('message', async (message) => {
-            // ... (Group chat logic) ...
-             try {
+            try {
                 const { type, payload } = JSON.parse(message);
                 if (type === 'AUTH') {
                     const { data: { user } } = await supabase.auth.getUser(payload.token);
                     if (!user) return ws.close();
                     const { data: profile } = await supabase.from('profiles').select('username').eq('id', user.id).single();
-                    ws.userId = user.id; ws.username = profile?.username || 'User';
+                    ws.userId = user.id;
+                    ws.username = profile?.username || 'User';
                     groupChatClients.add(ws);
                     ws.send(JSON.stringify({ type: 'AUTH_SUCCESS' }));
                 }
                 if (type === 'SEND_MESSAGE' && ws.userId) {
-                    const { data: savedMsg } = await supabase.from('group_chat_messages').insert({ user_id: ws.userId, username: ws.username, message_text: payload.message_text }).select().single();
-                    const msgString = JSON.stringify({ type: 'NEW_MESSAGE', payload: savedMsg });
-                    for (const client of groupChatClients) if (client.readyState === 1) client.send(msgString);
+                    const { data: savedMsg, error: insertError } = await supabase.from('group_chat_messages').insert({
+                        user_id: ws.userId,
+                        username: ws.username,
+                        message_text: payload.message_text
+                    }).select().single();
+
+                    if (insertError) {
+                        console.error('Global Chat DB Insert Error:', insertError);
+                        throw new Error(`Supabase insert error: ${insertError.message}`);
+                    }
+
+                    if (savedMsg) {
+                        const msgString = JSON.stringify({ type: 'NEW_MESSAGE', payload: savedMsg });
+                        for (const client of groupChatClients) {
+                            if (client.readyState === 1) client.send(msgString);
+                        }
+                    }
                 }
-            } catch (e) {}
+            } catch (e) {
+                console.error('Error in group-chat message handler:', e);
+            }
         });
         ws.on('close', () => groupChatClients.delete(ws));
         return;
     }
 
     if (url === '/support') {
-         // ... (Support logic) ...
-         ws.on('message', async(message) => {
+        ws.on('message', async (message) => {
             try {
                 const { type, payload } = JSON.parse(message);
                 if (type === 'AUTH') {
-                     const { data: { user } } = await supabase.auth.getUser(payload.token);
-                     if (!user) return ws.close();
-                     const { data: profile } = await supabase.from('profiles').select('role, username').eq('id', user.id).single();
-                     ws.userId = user.id; ws.userRole = profile?.role || 'user'; ws.username = profile?.username || 'User';
-                     if (ws.userRole === 'admin') adminSupportClients.add(ws); else supportClients.set(ws.userId, ws);
-                     ws.send(JSON.stringify({ type: 'AUTH_SUCCESS' }));
+                    const { data: { user } } = await supabase.auth.getUser(payload.token);
+                    if (!user) return ws.close();
+                    const { data: profile } = await supabase.from('profiles').select('role, username').eq('id', user.id).single();
+                    ws.userId = user.id;
+                    ws.userRole = profile?.role || 'user';
+                    ws.username = profile?.username || 'User';
+                    if (ws.userRole === 'admin') adminSupportClients.add(ws);
+                    else supportClients.set(ws.userId, ws);
+                    ws.send(JSON.stringify({ type: 'AUTH_SUCCESS' }));
                 }
-                // ... (Handling messages/typing) ...
-                 if (type === 'SEND_MESSAGE' && ws.userId) {
+                if (type === 'SEND_MESSAGE' && ws.userId) {
                     const { message_text, target_user_id } = payload;
                     const isSenderAdmin = ws.userRole === 'admin';
                     const conversationOwnerId = isSenderAdmin ? target_user_id : ws.userId;
-                    const { data: savedMsg } = await supabase.from('support_chats').insert({ user_id: conversationOwnerId, username: isSenderAdmin ? 'Admin' : ws.username, message_text, sent_by_admin: isSenderAdmin }).select().single();
-                    const msgString = JSON.stringify({ type: 'NEW_MESSAGE', payload: savedMsg });
-                    const userSocket = supportClients.get(conversationOwnerId);
-                    if (userSocket && userSocket.readyState === 1) userSocket.send(msgString);
-                    for (const adminWs of adminSupportClients) if (adminWs.readyState === 1) adminWs.send(msgString);
-                 }
-            } catch(e) {}
-         });
-         ws.on('close', () => { supportClients.delete(ws.userId); adminSupportClients.delete(ws); });
-         return;
+                    const { data: savedMsg, error: insertError } = await supabase.from('support_chats').insert({
+                        user_id: conversationOwnerId,
+                        username: isSenderAdmin ? 'Admin' : ws.username,
+                        message_text,
+                        sent_by_admin: isSenderAdmin
+                    }).select().single();
+
+                    if (insertError) {
+                        console.error('Support Chat DB Insert Error:', insertError);
+                        throw new Error(`Supabase insert error: ${insertError.message}`);
+                    }
+
+                    if (savedMsg) {
+                        const msgString = JSON.stringify({ type: 'NEW_MESSAGE', payload: savedMsg });
+                        const userSocket = supportClients.get(conversationOwnerId);
+                        if (userSocket && userSocket.readyState === 1) userSocket.send(msgString);
+                        for (const adminWs of adminSupportClients) {
+                            if (adminWs.readyState === 1) adminWs.send(msgString);
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error('Error in support message handler:', e);
+            }
+        });
+        ws.on('close', () => { supportClients.delete(ws.userId); adminSupportClients.delete(ws); });
+        return;
     }
 
 
