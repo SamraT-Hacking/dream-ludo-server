@@ -1,11 +1,12 @@
+
 // /dream-ludo-server/server.js
 require('dotenv').config();
 const express = require('express');
 const { createServer } = require('http');
 const { WebSocketServer } = require('ws');
 const { createClient } = require('@supabase/supabase-js');
-const PaytmChecksum = require('./paytmChecksum'); // Import Paytm utility
-const RazorpayUtils = require('./razorpayUtils'); // Import Razorpay utility
+const PaytmChecksum = require('./paytmChecksum');
+const RazorpayUtils = require('./razorpayUtils');
 
 const {
     createNewGame, addPlayer, startGame,
@@ -16,21 +17,74 @@ const {
 
 // --- Server & Supabase Setup ---
 const PORT = process.env.PORT || 8080;
-const { SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_KEY } = process.env;
+const { SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_KEY, PURCHASE_CODE, LICENSE_SERVER_URL, SELF_URL } = process.env;
 
 if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !SUPABASE_SERVICE_KEY) {
     console.error("CRITICAL ERROR: One or more Supabase environment variables are missing.");
-    console.error("Ensure SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_SERVICE_KEY are set in your .env file.");
     process.exit(1);
+}
+
+if (!PURCHASE_CODE || !LICENSE_SERVER_URL) {
+    console.error("CRITICAL ERROR: LICENSE CONFIG MISSING. Please set PURCHASE_CODE and LICENSE_SERVER_URL in .env");
+    // We don't exit yet, we try to run but game logic will be locked.
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const games = new Map();
-const supportClients = new Map(); // userId -> WebSocket
-const adminSupportClients = new Set(); // Set<WebSocket>
-const groupChatClients = new Set(); // Set<WebSocket> for global chat
+const supportClients = new Map();
+const adminSupportClients = new Set();
+const groupChatClients = new Set();
 
 const app = express();
+
+// --- LICENSE LOCK STATE ---
+let IS_LICENSED = false;
+const LICENSE_CHECK_INTERVAL = 24 * 60 * 60 * 1000; // Check every 24 hours
+
+// Verify license with the licensing server
+const verifyServerLicense = async () => {
+    if (!PURCHASE_CODE || !LICENSE_SERVER_URL) {
+        console.error("License Verification Failed: Missing Config");
+        IS_LICENSED = false;
+        return;
+    }
+
+    try {
+        // Determine current domain/host. For Render/Vercel, use configured env var or infer.
+        // For local testing, it might default to localhost.
+        // The license server handles 'localhost' gracefully for dev.
+        let currentDomain = SELF_URL ? new URL(SELF_URL).hostname : 'localhost';
+
+        const response = await fetch(`${LICENSE_SERVER_URL}/api/verify-server-license`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                purchase_code: PURCHASE_CODE,
+                domain: currentDomain 
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.active && data.secret_key === "DREAM-LUDO-SECURE-LOGIC-KEY-V1") {
+            console.log("✅ Server License Verified Successfully.");
+            IS_LICENSED = true;
+        } else {
+            console.error("❌ Server License Verification Failed:", data.message);
+            IS_LICENSED = false;
+        }
+    } catch (error) {
+        console.error("❌ License Server Connection Error:", error.message);
+        // Optional: Implement retry logic or fail-open/fail-closed depending on strictness
+        IS_LICENSED = false; 
+    }
+};
+
+// Run initial check
+verifyServerLicense();
+// Schedule periodic checks
+setInterval(verifyServerLicense, LICENSE_CHECK_INTERVAL);
+
 
 // CORS Middleware
 app.use((req, res, next) => {
@@ -46,11 +100,9 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true })); 
 
 const server = createServer(app);
-
-// --- Unified WebSocket Server ---
 const wss = new WebSocketServer({ server });
 
-app.get('/health', (req, res) => res.send('OK'));
+app.get('/health', (req, res) => res.send(IS_LICENSED ? 'OK' : 'UNLICENSED'));
 
 // --- Helpers ---
 
@@ -58,10 +110,6 @@ function isValidUuid(id) {
     const regex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     return typeof id === 'string' && regex.test(id);
 }
-
-// ... (Payment Logic Functions remain unchanged for brevity, including processDepositServerSide, etc.) ...
-// Note: Since I am replacing the file content, I must include the payment logic. 
-// However, for the sake of this specific update request about the Timer, I will include the full content below.
 
 async function processDepositServerSide(transactionId, paymentMethod = null) {
     if (!isValidUuid(transactionId)) return false;
@@ -297,11 +345,6 @@ app.get('/api/payment/razorpay-callback', async (req, res) => {
     else res.send("Done");
 });
 
-app.post('/api/payment/verify', async (req, res) => {
-    // Verification logic... same as before
-    res.json({message: 'Manual verify endpoint'});
-});
-
 // --- GAME TIMER MANAGEMENT ---
 function startGameLoop(gameCode) {
     const game = games.get(gameCode);
@@ -316,19 +359,13 @@ function startGameLoop(gameCode) {
             return;
         }
         
-        // Only decrease timer if the game is actively playing and not rolling/animating (optional)
-        // Usually Ludo timers run strictly.
         if (game.state.gameStatus === 'Playing' && game.state.diceValue === null && !game.state.isRolling) {
             if (game.state.turnTimeLeft > 0) {
                 game.state.turnTimeLeft--;
             } else {
-                // Time's up
                 console.log(`Time up for player in game ${gameCode}`);
                 await handleMissedTurn(game.state, supabase);
-                // handleMissedTurn updates state and possibly advances turn, resetting turnTimeLeft in game.js
             }
-            
-            // Broadcast updated time/state
             broadcastGameState(gameCode); 
         }
     }, 1000);
@@ -370,10 +407,7 @@ wss.on('connection', (ws, req) => {
                         message_text: payload.message_text
                     }).select().single();
 
-                    if (insertError) {
-                        console.error('Global Chat DB Insert Error:', insertError);
-                        throw new Error(`Supabase insert error: ${insertError.message}`);
-                    }
+                    if (insertError) console.error('Global Chat DB Insert Error:', insertError);
 
                     if (savedMsg) {
                         const msgString = JSON.stringify({ type: 'NEW_MESSAGE', payload: savedMsg });
@@ -416,10 +450,7 @@ wss.on('connection', (ws, req) => {
                         sent_by_admin: isSenderAdmin
                     }).select().single();
 
-                    if (insertError) {
-                        console.error('Support Chat DB Insert Error:', insertError);
-                        throw new Error(`Supabase insert error: ${insertError.message}`);
-                    }
+                    if (insertError) console.error('Support Chat DB Insert Error:', insertError);
 
                     if (savedMsg) {
                         const msgString = JSON.stringify({ type: 'NEW_MESSAGE', payload: savedMsg });
@@ -491,27 +522,39 @@ wss.on('connection', (ws, req) => {
             const game = games.get(gameCode);
             if (!game) return;
 
+            // *** CRITICAL SECURITY: All game actions check IS_LICENSED ***
+            // We pass IS_LICENSED to logic functions that perform critical updates
+            
             switch (action) {
                 case 'START_GAME': 
-                    await startGame(game.state, ws.userId, supabase); 
-                    startGameLoop(gameCode); // Start the timer loop
+                    await startGame(game.state, ws.userId, supabase, IS_LICENSED); 
+                    startGameLoop(gameCode); 
                     break;
                 case 'ROLL_DICE': 
+                    // Check license here before processing logic
+                    if (!IS_LICENSED) {
+                        game.state.message = "⚠️ Game Locked: Server Unlicensed";
+                        broadcastGameState(gameCode);
+                        return;
+                    }
+                    
                     initiateRoll(game.state, ws.userId);
                     broadcastGameState(gameCode);
                     setTimeout(async () => {
-                        const rolledAgain = await completeRoll(game.state, ws.userId, supabase);
+                        const rolledAgain = await completeRoll(game.state, ws.userId, supabase, IS_LICENSED);
                         broadcastGameState(gameCode);
-                        // If rolledAgain is true (no moves), handle turn pass
                          if (rolledAgain) {
                              setTimeout(async () => {
-                                await handleMissedTurn(game.state, supabase); // Technically checking rules, might just auto-pass
+                                await handleMissedTurn(game.state, supabase); 
                                 broadcastGameState(gameCode);
                              }, 1000);
                         }
                     }, 500);
                     return;
-                case 'MOVE_PIECE': await movePiece(game.state, ws.userId, payload.pieceId, supabase); break;
+                case 'MOVE_PIECE': 
+                    if (!IS_LICENSED) return; // Silently fail or send error
+                    await movePiece(game.state, ws.userId, payload.pieceId, supabase); 
+                    break;
                 case 'LEAVE_GAME': await leaveGame(game.state, ws.userId, supabase); break;
                 case 'SEND_CHAT_MESSAGE': await sendChatMessage(game.state, ws.userId, payload.text, supabase); break;
             }
