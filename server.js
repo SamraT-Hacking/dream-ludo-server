@@ -542,3 +542,10 @@ wss.on('connection', (ws, req) => {
 });
 
 server.listen(PORT, () => console.log(`Dream Ludo server listening on port ${PORT}`));
+
+
+// --- Health Check Endpoint (for Render Keep-Alive) ---
+app.get('/health', (req, res) => {
+    res.status(200).json({ status: 'OK', timestamp: Date.now() });
+});
+
