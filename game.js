@@ -1,3 +1,4 @@
+
 // /dream-ludo-server/game.js
 const { v4: uuidv4 } = require('uuid');
 
@@ -10,7 +11,7 @@ const TOTAL_PATH_LENGTH = 52;
 const HOME_STRETCH_LENGTH = 6;
 const FINISH_POSITION_START = 100;
 const TURN_TIME_LIMIT = 30;
-const MAX_INACTIVE_TURNS = 5; // UPDATED: Changed from 3 to 5
+const MAX_INACTIVE_TURNS = 5; 
 
 const START_POSITIONS = {
   [PlayerColor.Green]: 1,
@@ -51,6 +52,8 @@ function createPlayer(playerId, name, color, isHost = false) {
     hasFinished: false,
     isRemoved: false,
     inactiveTurns: 0,
+    consecutiveSixes: 0, // Rule 1.1: Track consecutive 6s
+    rollsWithoutSix: 0,  // Rule 2: Track rolls without 6 when stuck
   };
 }
 
@@ -144,17 +147,17 @@ async function advanceTurn(gameState, supabase) {
         checkedAll++;
     }
 
-    // REMOVED: Auto-win logic when only one player is left.
-    // The game should only end when someone wins properly.
     const activePlayers = gameState.players.filter(p => !p.isRemoved && !p.hasFinished);
     if (activePlayers.length === 0 && gameState.players.length > 1) {
         gameState.gameStatus = GameStatus.Finished;
-        gameState.winner = null; // No winner if all players leave
+        gameState.winner = null;
         gameState.message = "Game Over! No active players left.";
         await logTurnActivity(gameState, { description: `Game finished. No winner.` }, supabase);
         return;
     }
 
+    // Reset state for the next player
+    gameState.players[nextIndex].consecutiveSixes = 0; // Reset 6s counter on new turn
     gameState.currentPlayerIndex = nextIndex;
     gameState.diceValue = null;
     gameState.isRolling = false;
@@ -251,18 +254,53 @@ async function completeRoll(gameState, playerId, supabase) {
     
     currentPlayer.inactiveTurns = 0; // Player took an action, reset counter.
 
-    const diceValue = Math.floor(Math.random() * 6) + 1;
+    // Rule 2: Forced 6 if no pieces on board and failed multiple times
+    const allPiecesHome = currentPlayer.pieces.every(p => p.state === PieceState.Home);
+    let diceValue;
+
+    // If all pieces are home and they've rolled 4 times without a 6 (this is the 5th try), force a 6.
+    // Assuming logic: "4-5 times" -> Force on 5th attempt if count is 4.
+    if (allPiecesHome && currentPlayer.rollsWithoutSix >= 4) {
+        diceValue = 6;
+    } else {
+        diceValue = Math.floor(Math.random() * 6) + 1;
+    }
+
     gameState.diceValue = diceValue;
     gameState.isRolling = false;
     
+    // Update 6 counters
+    if (diceValue === 6) {
+        currentPlayer.rollsWithoutSix = 0; // Reset pity counter
+        currentPlayer.consecutiveSixes += 1;
+    } else {
+        if (allPiecesHome) {
+            currentPlayer.rollsWithoutSix += 1;
+        }
+        currentPlayer.consecutiveSixes = 0; // Reset sequence
+    }
+
+    // Rule 1.1: Three 6s in a row penalty
+    if (currentPlayer.consecutiveSixes === 3) {
+        gameState.message = `${currentPlayer.name} rolled three 6s! Turn forfeited.`;
+        await logTurnActivity(gameState, { 
+            userId: currentPlayer.playerId, 
+            name: currentPlayer.name, 
+            description: `rolled a 3rd six (penalty). Turn lost.` 
+        }, supabase);
+        
+        // End turn immediately
+        await advanceTurn(gameState, supabase);
+        return true; // Signal that turn is handled (no moves to calculate)
+    }
+
     const movablePieces = calculateMovablePieces(currentPlayer, diceValue);
     gameState.movablePieces = movablePieces;
     gameState.message = `${currentPlayer.name} rolled a ${diceValue}.`;
     await logTurnActivity(gameState, { userId: currentPlayer.playerId, name: currentPlayer.name, description: `rolled a ${diceValue}.` }, supabase);
 
-
     if (movablePieces.length === 0) {
-        return true; 
+        return true; // Indicates roll complete, but no moves, caller should handle turn pass delay
     }
     return false;
 }
@@ -282,10 +320,11 @@ async function movePiece(gameState, playerId, pieceId, supabase) {
     pieceToMove.state = newState;
     await logTurnActivity(gameState, { userId: currentPlayer.playerId, name: currentPlayer.name, description: `moved piece to position ${newPos}.` }, supabase);
 
-
     let capturedPiece = false;
+    let pieceFinished = false; // Track Rule 3
     gameState.message = `${currentPlayer.name} moved a piece.`;
 
+    // Check capture
     if (newState === PieceState.Active && newPos < FINISH_POSITION_START && !SAFE_SPOTS.includes(newPos)) {
         for (const opponent of gameState.players) {
             if (opponent.color === currentPlayer.color) continue;
@@ -301,9 +340,16 @@ async function movePiece(gameState, playerId, pieceId, supabase) {
         }
     }
 
+    // Rule 3: Check if piece finished
+    if (newState === PieceState.Finished) {
+        pieceFinished = true;
+        gameState.message = `${currentPlayer.name}'s piece reached Home! Extra Turn.`;
+        await logTurnActivity(gameState, { userId: currentPlayer.playerId, name: currentPlayer.name, description: `piece reached home.` }, supabase);
+    }
+
+    // Check Win Condition
     if (currentPlayer.pieces.every(p => p.state === PieceState.Finished)) {
         currentPlayer.hasFinished = true;
-        // This is the only valid win condition now
         gameState.winner = currentPlayer;
         gameState.gameStatus = GameStatus.Finished;
         gameState.message = `${currentPlayer.name} wins the game!`;
@@ -311,9 +357,18 @@ async function movePiece(gameState, playerId, pieceId, supabase) {
         return;
     }
 
-    if (gameState.diceValue === 6 || capturedPiece) {
+    // Logic for Extra Turn:
+    // 1. Rule 1: Rolled a 6
+    // 2. Capture: Captured opponent piece
+    // 3. Rule 3: Piece reached Home
+    if (gameState.diceValue === 6 || capturedPiece || pieceFinished) {
         gameState.diceValue = null;
         gameState.movablePieces = [];
+        gameState.isRolling = false;
+        // If it wasn't a 6 that caused the extra turn (e.g. finished with a 3), we reset consecutive sixes
+        if (gameState.diceValue !== 6) {
+             currentPlayer.consecutiveSixes = 0;
+        }
         gameState.message += " Roll again!";
         gameState.turnTimeLeft = TURN_TIME_LIMIT;
     } else {
@@ -378,7 +433,6 @@ async function sendChatMessage(gameState, playerId, text, supabase) {
     gameState.chatMessages.push(message);
     if (gameState.chatMessages.length > 50) gameState.chatMessages.shift();
     
-    // **DATABASE INSERTION LOGIC**
     if (gameState.tournamentId && supabase) {
         try {
             const { error } = await supabase.from('chat_messages').insert({
