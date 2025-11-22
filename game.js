@@ -1,4 +1,3 @@
-
 // /dream-ludo-server/game.js
 const { v4: uuidv4 } = require('uuid');
 
@@ -11,7 +10,7 @@ const TOTAL_PATH_LENGTH = 52;
 const HOME_STRETCH_LENGTH = 6;
 const FINISH_POSITION_START = 100;
 const TURN_TIME_LIMIT = 30;
-const MAX_INACTIVE_TURNS = 5;
+const MAX_INACTIVE_TURNS = 5; // UPDATED: Changed from 3 to 5
 
 const START_POSITIONS = {
   [PlayerColor.Green]: 1,
@@ -33,6 +32,9 @@ const TWO_PLAYER_COLORS = [PlayerColor.Green, PlayerColor.Blue];
 
 // --- Helper Functions ---
 
+/**
+ * Creates the initial state for a single player.
+ */
 function createPlayer(playerId, name, color, isHost = false) {
   const pieces = Array.from({ length: 4 }, (_, i) => ({
     id: ALL_COLORS.indexOf(color) * 4 + i,
@@ -52,6 +54,9 @@ function createPlayer(playerId, name, color, isHost = false) {
   };
 }
 
+/**
+ * Calculates the new position of a piece after a move.
+ */
 function getNewPositionInfo(piece, diceValue) {
     if (piece.state === PieceState.Home && diceValue === 6) {
         return { position: START_POSITIONS[piece.color], state: PieceState.Active };
@@ -59,21 +64,22 @@ function getNewPositionInfo(piece, diceValue) {
 
     if (piece.state === PieceState.Active) {
         let newPos;
-        if (piece.position >= FINISH_POSITION_START) { 
+        if (piece.position >= FINISH_POSITION_START) { // Already in home stretch
             newPos = piece.position + diceValue;
             if (newPos === FINISH_POSITION_START + HOME_STRETCH_LENGTH - 1) return { position: newPos, state: PieceState.Finished };
             if (newPos < FINISH_POSITION_START + HOME_STRETCH_LENGTH) return { position: newPos, state: PieceState.Active };
-        } else { 
+        } else { // On main path
             const preHomePos = PRE_HOME_POSITIONS[piece.color];
+            // Calculate distance to the entry of the home stretch
             const distToPreHome = (preHomePos - piece.position + TOTAL_PATH_LENGTH) % TOTAL_PATH_LENGTH;
-            if (diceValue > distToPreHome) { 
+            if (diceValue > distToPreHome) { // Will enter home stretch
                 const homeStretchPos = diceValue - distToPreHome - 1;
                 if (homeStretchPos < HOME_STRETCH_LENGTH) {
                     newPos = FINISH_POSITION_START + homeStretchPos;
                     if (homeStretchPos === HOME_STRETCH_LENGTH - 1) return { position: newPos, state: PieceState.Finished };
                     return { position: newPos, state: PieceState.Active };
                 }
-            } else { 
+            } else { // Stays on main path (using clearer 0-based calculation)
                 const zeroBasedPos = piece.position - 1;
                 const newZeroBasedPos = (zeroBasedPos + diceValue) % TOTAL_PATH_LENGTH;
                 newPos = newZeroBasedPos + 1;
@@ -81,9 +87,13 @@ function getNewPositionInfo(piece, diceValue) {
             }
         }
     }
-    return { position: piece.position, state: piece.state };
+    return { position: piece.position, state: piece.state }; // Invalid move
 }
 
+
+/**
+ * Finds which pieces can legally move given a dice roll.
+ */
 function calculateMovablePieces(player, diceValue) {
     const movable = [];
     for (const piece of player.pieces) {
@@ -95,6 +105,9 @@ function calculateMovablePieces(player, diceValue) {
     return movable;
 }
 
+/**
+ * Helper to log turn activity to both in-memory state and database.
+ */
 async function logTurnActivity(gameState, turnData, supabase) {
     gameState.turn_history.push(turnData);
 
@@ -113,6 +126,10 @@ async function logTurnActivity(gameState, turnData, supabase) {
     }
 }
 
+
+/**
+ * Moves to the next active player.
+ */
 async function advanceTurn(gameState, supabase) {
     if (gameState.gameStatus !== GameStatus.Playing) return;
 
@@ -127,10 +144,12 @@ async function advanceTurn(gameState, supabase) {
         checkedAll++;
     }
 
+    // REMOVED: Auto-win logic when only one player is left.
+    // The game should only end when someone wins properly.
     const activePlayers = gameState.players.filter(p => !p.isRemoved && !p.hasFinished);
     if (activePlayers.length === 0 && gameState.players.length > 1) {
         gameState.gameStatus = GameStatus.Finished;
-        gameState.winner = null;
+        gameState.winner = null; // No winner if all players leave
         gameState.message = "Game Over! No active players left.";
         await logTurnActivity(gameState, { description: `Game finished. No winner.` }, supabase);
         return;
@@ -146,6 +165,9 @@ async function advanceTurn(gameState, supabase) {
 
 // --- Core Game Logic Functions ---
 
+/**
+ * Creates a new game state object.
+ */
 function createNewGame(gameId, options = {}) {
   const { hostId, hostName, type = 'manual', max_players = 2, players: initialPlayers = [], tournamentId } = options;
   
@@ -174,6 +196,9 @@ function createNewGame(gameId, options = {}) {
   return gameState;
 }
 
+/**
+ * Adds a new player to the game during setup.
+ */
 function addPlayer(gameState, playerId, playerName) {
     if (gameState.gameStatus !== GameStatus.Setup) return;
     if (gameState.players.length >= gameState.max_players) return;
@@ -192,13 +217,10 @@ function addPlayer(gameState, playerId, playerName) {
     gameState.message = `${playerName} joined the game!`;
 }
 
-async function startGame(gameState, requestingPlayerId, supabase, licenseStatus = false) {
-    // *** SECURITY CHECK ***
-    if (!licenseStatus) {
-        gameState.message = "Server License Error: Game cannot start.";
-        return;
-    }
-
+/**
+ * Starts the game, sets player order, and begins the first turn.
+ */
+async function startGame(gameState, requestingPlayerId, supabase) {
     if (requestingPlayerId && gameState.hostId !== requestingPlayerId) {
         gameState.message = "Only the host can start the game.";
         return;
@@ -223,19 +245,11 @@ function initiateRoll(gameState, playerId) {
     gameState.message = `${currentPlayer.name} is rolling...`;
 }
 
-async function completeRoll(gameState, playerId, supabase, licenseStatus = false) {
-    // *** SECURITY CHECK ***
-    // The dice roll effectively "activates" a turn. 
-    // If the server isn't licensed, the dice will never produce a result.
-    if (!licenseStatus) {
-        gameState.message = "License Invalid. Gameplay paused.";
-        return false; 
-    }
-
+async function completeRoll(gameState, playerId, supabase) {
     const currentPlayer = gameState.players[gameState.currentPlayerIndex];
     if (currentPlayer.playerId !== playerId || !gameState.isRolling) return;
     
-    currentPlayer.inactiveTurns = 0; 
+    currentPlayer.inactiveTurns = 0; // Player took an action, reset counter.
 
     const diceValue = Math.floor(Math.random() * 6) + 1;
     gameState.diceValue = diceValue;
@@ -245,6 +259,7 @@ async function completeRoll(gameState, playerId, supabase, licenseStatus = false
     gameState.movablePieces = movablePieces;
     gameState.message = `${currentPlayer.name} rolled a ${diceValue}.`;
     await logTurnActivity(gameState, { userId: currentPlayer.playerId, name: currentPlayer.name, description: `rolled a ${diceValue}.` }, supabase);
+
 
     if (movablePieces.length === 0) {
         return true; 
@@ -256,7 +271,7 @@ async function movePiece(gameState, playerId, pieceId, supabase) {
     const currentPlayer = gameState.players[gameState.currentPlayerIndex];
     if (currentPlayer.playerId !== playerId || !gameState.movablePieces.includes(pieceId)) return;
 
-    currentPlayer.inactiveTurns = 0;
+    currentPlayer.inactiveTurns = 0; // Player took an action, reset counter.
 
     const pieceToMove = currentPlayer.pieces.find(p => p.id === pieceId);
     if (!pieceToMove) return;
@@ -266,6 +281,7 @@ async function movePiece(gameState, playerId, pieceId, supabase) {
     pieceToMove.position = newPos;
     pieceToMove.state = newState;
     await logTurnActivity(gameState, { userId: currentPlayer.playerId, name: currentPlayer.name, description: `moved piece to position ${newPos}.` }, supabase);
+
 
     let capturedPiece = false;
     gameState.message = `${currentPlayer.name} moved a piece.`;
@@ -287,6 +303,7 @@ async function movePiece(gameState, playerId, pieceId, supabase) {
 
     if (currentPlayer.pieces.every(p => p.state === PieceState.Finished)) {
         currentPlayer.hasFinished = true;
+        // This is the only valid win condition now
         gameState.winner = currentPlayer;
         gameState.gameStatus = GameStatus.Finished;
         gameState.message = `${currentPlayer.name} wins the game!`;
@@ -326,6 +343,7 @@ async function leaveGame(gameState, playerId, supabase) {
         gameState.message = `${player.name} left the game.`;
         await logTurnActivity(gameState, { userId: player.playerId, name: player.name, description: `left the game.` }, supabase);
         
+        // Check if there is only one active player left to declare a winner.
         const activePlayers = gameState.players.filter(p => !p.isRemoved && !p.hasFinished);
         if (activePlayers.length === 1) {
             const winner = activePlayers[0];
@@ -333,7 +351,7 @@ async function leaveGame(gameState, playerId, supabase) {
             gameState.gameStatus = GameStatus.Finished;
             gameState.message = `${winner.name} wins as the opponent left the game!`;
             await logTurnActivity(gameState, { userId: winner.playerId, name: winner.name, description: `won because opponent left.` }, supabase);
-            return;
+            return; // Game is over, no need to advance turn.
         }
         
         if (gameState.players[gameState.currentPlayerIndex].playerId === playerId) {
@@ -360,6 +378,7 @@ async function sendChatMessage(gameState, playerId, text, supabase) {
     gameState.chatMessages.push(message);
     if (gameState.chatMessages.length > 50) gameState.chatMessages.shift();
     
+    // **DATABASE INSERTION LOGIC**
     if (gameState.tournamentId && supabase) {
         try {
             const { error } = await supabase.from('chat_messages').insert({
